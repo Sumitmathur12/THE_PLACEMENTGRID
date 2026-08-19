@@ -1,0 +1,13 @@
+# Dependencies (Frontend & Backend)
+node_modules/
+**/node_modules/
+
+# Environment Variables (Frontend & Backend)
+.env
+.env.local
+.env.*.local
+*.env
+**/env
+
+
+
