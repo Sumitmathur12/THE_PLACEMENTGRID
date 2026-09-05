@@ -4,6 +4,7 @@ import pdfParse from 'pdf-parse';
 import { getStructuredResume, getProjectTalkingPoints } from '../services/aiService.js';
 import { requireAuth } from './auth.js';
 import { uploadResumeToImageKit } from '../services/storageService.js';
+import { logGenuineActivity } from '../services/activityService.js';
 
 const router = express.Router();
 
@@ -61,6 +62,14 @@ router.post('/resume-upload', requireAuth, upload.single('resume'), async (req, 
     };
 
     await user.save();
+
+    // A meaningful resume analysis action — counts toward the daily streak and Prep Score.
+    try {
+      await logGenuineActivity(user._id, 'resume');
+    } catch (activityErr) {
+      console.error('Failed to log resume activity:', activityErr.message);
+    }
+
     return res.json({ success: true, resume: user.resume });
   } catch (error) {
     console.error('Resume Parsing Error:', error);

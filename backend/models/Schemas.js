@@ -17,6 +17,18 @@ const UserSchema = new mongoose.Schema({
   totalQuestionsAttempted: { type: Number, default: 0 },
   weeklyScore: { type: Number, default: 0 },
   allTimeScore: { type: Number, default: 0 },
+  roadmapCompletionPct: { type: Number, default: 0 },
+  targetRole: { type: String, default: '' },
+  // Weekly breakdown numbers (cached alongside weeklyScore) — used to power
+  // achievement badges without re-aggregating DailyActivity on every request.
+  weeklyQuestionsAttempted: { type: Number, default: 0 },
+  weeklyRoadmapTasksCompleted: { type: Number, default: 0 },
+  // Rank-movement tracking: snapshotted once per IST week (on the user's
+  // first genuine activity of a new week), so the leaderboard can show
+  // "you moved up 3 spots since last week" instead of just a static rank.
+  weeklyScoreSnapshotWeek: { type: String, default: '' }, // the Monday (YYYY-MM-DD) this snapshot belongs to
+  previousWeeklyScore: { type: Number, default: 0 },
+  previousWeeklyRank: { type: Number, default: null },
   displayHandle: { type: String, default: '' },
   leaderboardOptIn: { type: Boolean, default: false },
   lastHeartbeatAt: { type: Date },

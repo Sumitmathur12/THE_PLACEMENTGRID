@@ -259,6 +259,13 @@ router.post('/:id/role-roadmap', requireAuth, async (req, res) => {
     // Find custom User-specific roadmap in the database
     let roadmap = await Roadmap.findOne({ domain: domainName, userId: req.user._id });
 
+    // Generating a roadmap for a company+role is the clearest signal a
+    // student is actively targeting it — pin both for leaderboard scoping
+    // ("Same Target Company" and, where useful, role-level filtering).
+    req.user.targetCompany = company.name;
+    req.user.targetRole = role;
+    await req.user.save();
+
     // Generate week-by-week roadmap syllabus via LLM
     console.log(`Generating study roadmap for: ${domainName}`);
     const userBranch = req.user.branch || 'General';

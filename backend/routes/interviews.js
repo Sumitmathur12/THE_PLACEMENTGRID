@@ -3,6 +3,7 @@ import fetch from 'node-fetch'; // Ensure fetch works or use standard node fetch
 import { InterviewSession, User } from '../models/Schemas.js';
 import { getInterviewFeedback, ragRetrieve, generateLLMResponse, runWebSearch } from '../services/aiService.js';
 import { requireAuth } from './auth.js';
+import { logGenuineActivity } from '../services/activityService.js';
 
 const router = express.Router();
 
@@ -177,6 +178,15 @@ router.post('/submit-answer', requireAuth, async (req, res) => {
       };
 
       await session.save();
+
+      // Completing a full mock interview is a genuine, meaningful preparation
+      // activity — counts toward the daily streak and Prep Score.
+      try {
+        await logGenuineActivity(session.userId, 'interview');
+      } catch (activityErr) {
+        console.error('Failed to log interview activity:', activityErr.message);
+      }
+
       return res.json({ finished: true, session });
     }
 

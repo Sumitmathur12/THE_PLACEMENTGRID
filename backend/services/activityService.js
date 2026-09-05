@@ -7,7 +7,11 @@ export const CONFIG = {
   weeklyActiveTimeTarget: 60, // minutes
   longestStreakTarget: 100, // days
   totalQuestionsTarget: 500, // questions
-  totalActiveTimeTarget: 5000 // minutes
+  totalActiveTimeTarget: 5000, // minutes
+  // Anti-gaming heartbeat controls:
+  heartbeatMinIntervalSeconds: 50, // reject a heartbeat if the last one was more recent than this
+  heartbeatMaxCreditMinutes: 2,    // never credit more than this per single heartbeat, even after a long gap (e.g. laptop sleep)
+  dailyActiveMinutesCap: 240       // hard ceiling on genuineActiveMinutes credited per calendar day
 };
 
 // Shift UTC date to IST (UTC +5:30) timezone
@@ -141,26 +145,16 @@ export const recalculateStreakAndScore = async (userId) => {
   user.longestStreak = Math.max(user.longestStreak || 0, currentStreak);
   user.streakCount = currentStreak; // keep synced with basic field
 
-  // 2. Fetch User Roadmap Completion % dynamically
+  // 2. Fetch User Roadmap Completion % dynamically — based on THIS user's own
+  //    generated roadmap(s), never a shared/generic one. A user may have generated
+  //    roadmaps for multiple company+role combos over time; we use their most
+  //    recently updated one as the "active" target, since that reflects what
+  //    they're currently focused on. Roadmap size varies (SDE vs PM vs core-branch),
+  //    so completion is always computedTasks / thatRoadmap'sOwnTotalTasks — never
+  //    a hardcoded constant.
   let roadmapCompletion = 0;
-  let targetRoadmap = null;
-
-  if (user.targetCompany) {
-    targetRoadmap = await Roadmap.findOne({
-      companyId: { $ne: null },
-      domain: 'SDE' // default SDE template or match company
-    });
-    if (!targetRoadmap) {
-      targetRoadmap = await Roadmap.findOne({
-        domain: new RegExp(`^${user.targetCompany}$`, 'i')
-      });
-    }
-  }
-  
-  if (!targetRoadmap) {
-    // fallback to first roadmap in DB or default SDE roadmap
-    targetRoadmap = await Roadmap.findOne({});
-  }
+  let targetRoadmap = await Roadmap.findOne({ userId: user._id })
+    .sort({ updatedAt: -1 });
 
   if (targetRoadmap && targetRoadmap.weeks) {
     let totalTasks = 0;
@@ -180,6 +174,32 @@ export const recalculateStreakAndScore = async (userId) => {
 
   // 3. Compute Weekly Score (from this Monday in IST)
   const mondayStr = getISTMondayOfThisWeek();
+
+  // --- Rank-movement snapshot ---
+  // If this is the user's first recalculation of a NEW IST week (i.e. the
+  // week has rolled over since we last snapshotted), capture where they
+  // stood — their score and rank — at the moment the previous week ended,
+  // before we overwrite weeklyScore with this week's fresh numbers. This is
+  // what powers "↑3 / ↓2 / — unchanged" on the leaderboard.
+  if (user.weeklyScoreSnapshotWeek !== mondayStr) {
+    if (user.weeklyScoreSnapshotWeek) {
+      // Only snapshot a "previous" state if we actually had a prior week's
+      // score cached (skip this for a brand-new user's very first week).
+      let priorRank = null;
+      if (user.leaderboardOptIn && user.displayHandle) {
+        const higherCount = await User.countDocuments({
+          leaderboardOptIn: true,
+          displayHandle: { $ne: '' },
+          weeklyScore: { $gt: user.weeklyScore || 0 }
+        });
+        priorRank = higherCount + 1;
+      }
+      user.previousWeeklyScore = user.weeklyScore || 0;
+      user.previousWeeklyRank = priorRank;
+    }
+    user.weeklyScoreSnapshotWeek = mondayStr;
+  }
+
   const weeklyActivities = await DailyActivity.find({
     userId,
     date: { $gte: mondayStr }
@@ -228,6 +248,13 @@ export const recalculateStreakAndScore = async (userId) => {
     (activeTimeScore * 0.10)
   );
 
+  // Cache the raw weekly breakdown numbers too (not just the composite
+  // score) so achievement badges — "Question Crusher", "Roadmap Finisher" —
+  // can be computed cheaply from the User doc without re-aggregating
+  // DailyActivity on every leaderboard request.
+  user.weeklyQuestionsAttempted = weeklyUniqueQuestionsAttempted;
+  user.weeklyRoadmapTasksCompleted = weeklyRoadmapTasksCompleted;
+
   // 4. Compute All-Time Prep Score (Lifetime metrics)
   const allTimeStreakScore = Math.min((user.longestStreak || 0) / CONFIG.longestStreakTarget, 1) * 100;
   const allTimeQuestionScore = Math.min((user.totalQuestionsAttempted || 0) / CONFIG.totalQuestionsTarget, 1) * 100;
@@ -247,6 +274,7 @@ export const recalculateStreakAndScore = async (userId) => {
     (allTimeActiveTimeScore * 0.15)
   );
 
+  user.roadmapCompletionPct = Math.round(roadmapCompletion);
   user.lastActiveDate = new Date();
   await user.save();
 };
