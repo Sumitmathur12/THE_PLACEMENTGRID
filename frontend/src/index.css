@@ -1,0 +1,77 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-serif text-charcoal-900 tracking-tight;
+  }
+  
+  body {
+    @apply font-sans bg-cream-100 text-charcoal-900 selection:bg-sage-100 selection:text-sage-700;
+  }
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-cream-200;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-sage-500/20 rounded-full hover:bg-sage-500/40 transition-colors;
+}
+
+/* Premium page animations */
+.fade-in {
+  animation: fadeIn 0.4s ease-out forwards;
+}
+
+.animate-slide-in {
+  animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-scale-up {
+  animation: scaleUp 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideIn {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@keyframes scaleUp {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Grid overlay background to simulate high-quality study journal paper */
+.journal-grid {
+  background-size: 24px 24px;
+  background-image: 
+    linear-gradient(to right, rgba(58, 96, 83, 0.03) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(58, 96, 83, 0.03) 1px, transparent 1px);
+}
