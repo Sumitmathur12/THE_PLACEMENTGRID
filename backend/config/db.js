@@ -1,5 +1,10 @@
 import mongoose from 'mongoose';
 
+const maskMongoUri = (uri) => {
+  if (!uri) return '';
+  return uri.replace(/\/\/(.*):(.*)@/, (match, user) => `//${user}:****@`);
+};
+
 export const connectDB = async () => {
   const connUri = process.env.MONGODB_URI;
   if (!connUri) {
@@ -8,7 +13,7 @@ export const connectDB = async () => {
   }
 
   try {
-    console.log(`Attempting connection to MongoDB at: ${connUri}`);
+    console.log(`Attempting connection to MongoDB at: ${maskMongoUri(connUri)}`);
     const conn = await mongoose.connect(connUri, { serverSelectionTimeoutMS: 5000 });
     console.log(`MongoDB Connected: ${conn.connection.host}`);
 

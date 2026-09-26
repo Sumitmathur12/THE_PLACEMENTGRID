@@ -22,9 +22,9 @@ export const getEmbedding = async (text) => {
   }
 
   // 1. Try Gemini API if configured
-  // text-embedding-004 is on the v1 endpoint — @google/genai v2+ defaults to v1beta,
-  // which causes "models/text-embedding-004 is not found for API version v1beta" on startup.
-  // Fix: force apiVersion:'v1' in httpOptions.
+  // Live API verification via ListModels confirms available models: 'gemini-embedding-001', 'gemini-embedding-2'
+  // using API version 'v1'. Requesting config.outputDimensionality = 384 ensures 100% native dimension
+  // compatibility with 384-dim Xenova embeddings and MongoDB vector indexes.
   if (process.env.GEMINI_API_KEY) {
     try {
       const ai = new GoogleGenAI({
@@ -32,12 +32,13 @@ export const getEmbedding = async (text) => {
         httpOptions: { apiVersion: 'v1' },
       });
       const response = await ai.models.embedContent({
-        model: 'text-embedding-004',
+        model: 'gemini-embedding-001',
         contents: text,
+        config: { outputDimensionality: 384 },
       });
-      if (response && response.embedding && response.embedding.values) {
-        const values = response.embedding.values;
-        // text-embedding-004 returns 768 dims; our index stores 384 — slice/pad to match.
+
+      const values = response.embeddings?.[0]?.values || response.embedding?.values;
+      if (values && values.length > 0) {
         if (values.length === 384) return values;
         if (values.length > 384) return values.slice(0, 384);
         return [...values, ...new Array(384 - values.length).fill(0)];
