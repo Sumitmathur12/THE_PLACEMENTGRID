@@ -600,8 +600,12 @@ Remember: Do not invent any URLs. If no URLs exist in the context, list the topi
 export const getInterviewFeedback = async (transcript, companyName, proctorLogs, perQuestionEvaluations = []) => {
   const cleanCompanyName = (companyName || 'General Tech').replace(/_\d+$/, '');
   
-  const formattedTranscript = transcript.map(t => `${t.speaker.toUpperCase()}: ${t.text}`).join('\n');
-  const formattedLogs = proctorLogs.map(l => `[${l.event}] at ${new Date(l.timestamp).toLocaleTimeString()}: ${l.details}`).join('\n');
+  const formattedTranscript = (Array.isArray(transcript) ? transcript : [])
+    .map(t => typeof t === 'string' ? t : `${(t.speaker || t.questionText || 'Item').toUpperCase()}: ${t.text || t.answerText || t.feedback || ''}`)
+    .join('\n');
+  const formattedLogs = (Array.isArray(proctorLogs) ? proctorLogs : [])
+    .map(l => `[${l.event || 'LOG'}] at ${l.timestamp ? new Date(l.timestamp).toLocaleTimeString() : 'N/A'}: ${l.details || ''}`)
+    .join('\n');
 
   // Compute exact honest mathematical score from per-question evaluations
   const totalPoints = perQuestionEvaluations.reduce((sum, q) => sum + (typeof q.score === 'number' ? q.score : 0), 0);
