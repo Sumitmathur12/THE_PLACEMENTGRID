@@ -40,6 +40,11 @@ if (!process.env.TAVILY_API_KEY) {
 const app = express();
 const PORT = process.env.PORT || 5500;
 
+// Warn if NODE_ENV is not set to production (Render must set NODE_ENV=production via Dashboard env vars)
+if (process.env.NODE_ENV !== 'production') {
+  console.warn('[WARN] NODE_ENV is not "production". Set NODE_ENV=production in your Render environment variables.');
+}
+
 // Wrap Express in a plain HTTP server so Socket.io (used for the optional
 // live-streamed interviewer reaction in the Mock Interview section) can
 // attach to the exact same port — no separate server/port needed.
@@ -47,8 +52,21 @@ const httpServer = http.createServer(app);
 
 // 1. Apply Security Headers & CORS
 app.use(securityHeaders);
+
+const ALLOWED_ORIGINS = [
+  process.env.CLIENT_URL || 'https://the-placementgrid.vercel.app',
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://127.0.0.1:3000',
+];
+
 app.use(cors({
-  origin: true,
+  origin: (origin, callback) => {
+    // Allow requests with no origin (curl, Postman, server-to-server)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS: origin '${origin}' not allowed`));
+  },
   credentials: true
 }));
 

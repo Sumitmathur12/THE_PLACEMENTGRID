@@ -2,12 +2,30 @@
 node_modules/
 **/node_modules/
 
-# Environment Variables (Frontend & Backend)
+# Environment Variables (Frontend & Backend) — NEVER commit .env files
 .env
 .env.local
 .env.*.local
+.env.production
+.env.staging
 *.env
-**/env
+**/.env
+**/.env.local
+**/.env.*.local
 
+# Build outputs
+dist/
+build/
+.next/
 
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+*.log
+npm-debug.log*
 
+# Scratch / one-off scripts that may embed credentials (run locally only)
+backend/scratch/
+backend/e2e_test.js
+backend/clear_duplicates.js

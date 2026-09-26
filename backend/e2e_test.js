@@ -604,7 +604,9 @@ const runE2ETests = async () => {
   // Cleanup test database artifacts (deletes the newly created timestamped test company and its profiles/roadmaps)
   console.log('\nCleaning up E2E database artifacts...');
   try {
-    const mongoUri = process.env.MONGODB_URI || "mongodb+srv://sm4596932_db_user:Sumit123@cluster0.dngusnv.mongodb.net/?appName=Cluster0";
+    const mongoUri = process.env.MONGODB_URI;
+    if (!mongoUri) throw new Error('MONGODB_URI env var missing — cannot cleanup');
+
     await mongoose.connect(mongoUri);
     const CompanyCol = mongoose.connection.collection('companies');
     const RoleProfileCol = mongoose.connection.collection('roleprofiles');

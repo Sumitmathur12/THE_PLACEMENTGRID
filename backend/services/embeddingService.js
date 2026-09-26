@@ -22,25 +22,34 @@ export const getEmbedding = async (text) => {
   }
 
   // 1. Try Gemini API if configured
+  // text-embedding-004 is on the v1 endpoint — @google/genai v2+ defaults to v1beta,
+  // which causes "models/text-embedding-004 is not found for API version v1beta" on startup.
+  // Fix: force apiVersion:'v1' in httpOptions.
   if (process.env.GEMINI_API_KEY) {
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const ai = new GoogleGenAI({
+        apiKey: process.env.GEMINI_API_KEY,
+        httpOptions: { apiVersion: 'v1' },
+      });
       const response = await ai.models.embedContent({
         model: 'text-embedding-004',
         contents: text,
       });
       if (response && response.embedding && response.embedding.values) {
         const values = response.embedding.values;
+        // text-embedding-004 returns 768 dims; our index stores 384 — slice/pad to match.
         if (values.length === 384) return values;
         if (values.length > 384) return values.slice(0, 384);
         return [...values, ...new Array(384 - values.length).fill(0)];
       }
     } catch (err) {
-      console.warn('Gemini embedding failed, falling back to local extractor:', err.message);
+      // Log concisely — never throw, always fall through to local model
+      console.warn('[Embedding] Gemini API failed, using local fallback:', err.message);
     }
   }
 
   // 2. Try Local @xenova/transformers
+
   try {
     const { pipeline } = await import('@xenova/transformers');
     if (!localExtractor) {

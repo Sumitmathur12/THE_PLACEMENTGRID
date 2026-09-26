@@ -15,10 +15,10 @@ const runVerification = async () => {
   const email = "rotation_live_test@college.edu";
 
   console.log("Cleaning up user record from DB first...");
-  const mongoUri =
-    process.env.MONGODB_URI ||
-    "mongodb+srv://sm4596932_db_user:Sumit123@cluster0.dngusnv.mongodb.net/?appName=Cluster0"; // Replace with your default MongoDB URI if needed
+  const mongoUri = process.env.MONGODB_URI;
+  if (!mongoUri) { console.error('MONGODB_URI env var required'); process.exit(1); }
   await mongoose.connect(mongoUri);
+
   await mongoose.connection.collection("users").deleteOne({ email });
   await mongoose.disconnect();
 

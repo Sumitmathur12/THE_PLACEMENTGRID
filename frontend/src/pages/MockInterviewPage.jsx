@@ -95,8 +95,16 @@ export default function MockInterviewPage({ user, token }) {
   const [isStreamingReaction, setIsStreamingReaction] = useState(false);
 
   useEffect(() => {
-    const socketUrl = window.location.hostname === 'localhost' ? 'http://localhost:5500' : window.location.origin;
-    const s = io(socketUrl, { transports: ['websocket', 'polling'] });
+    // In dev: vite proxy handles /socket.io → localhost:5500 (ws:true in vite.config.js).
+    // In prod: connect directly to Render backend — Vercel cannot proxy WebSocket upgrades.
+    const socketUrl = import.meta.env.VITE_SOCKET_URL ||
+      (window.location.hostname === 'localhost' ? '' : 'https://the-placementgrid.onrender.com');
+    const s = io(socketUrl, {
+      transports: ['polling', 'websocket'], // polling first → stable HTTP handshake → upgrade to WS
+      withCredentials: true,
+      reconnectionAttempts: 3,
+      reconnectionDelay: 2000,
+    });
     setSocket(s);
 
     s.on('ai_chunk', (payload) => {

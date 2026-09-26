@@ -24,10 +24,17 @@ const initSocket = (httpServer) => {
 
   const io = new Server(httpServer, {
     cors: {
-      origin: process.env.CLIENT_URL || 'http://localhost:3000',
+      origin: [
+        process.env.CLIENT_URL || 'https://the-placementgrid.vercel.app',
+        'http://localhost:3000',
+        'http://localhost:5173',
+        'http://127.0.0.1:3000',
+      ],
       methods: ['GET', 'POST'],
       credentials: true
-    }
+    },
+    // Allow polling as fallback transport (needed for Render cold-start & some proxy environments)
+    allowEIO3: true,
   });
 
   io.on('connection', (socket) => {

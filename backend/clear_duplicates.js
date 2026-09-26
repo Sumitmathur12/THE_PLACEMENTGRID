@@ -4,8 +4,9 @@ import dotenv from 'dotenv';
 dotenv.config({ path: 'c:/Users/SUMIT MATHUR/Desktop/ThePlacementGrid/backend/.env' });
 
 const clearDuplicates = async () => {
-  const uri = process.env.MONGODB_URI || "mongodb+srv://sm4596932_db_user:Sumit123@cluster0.dngusnv.mongodb.net/?appName=Cluster0";
-  console.log('Connecting to:', uri);
+  const uri = process.env.MONGODB_URI;
+  if (!uri) { console.error('MONGODB_URI env var is required. Run: node --env-file=.env clear_duplicates.js'); process.exit(1); }
+
   try {
     await mongoose.connect(uri, { serverSelectionTimeoutMS: 5000 });
     console.log('Connected! Scanning for duplicates...');
