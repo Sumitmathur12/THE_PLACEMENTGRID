@@ -1,10 +1,12 @@
 import express from 'express';
+import http from 'http';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { connectDB } from './config/db.js';
 import { seedDatabase } from './services/seedData.js';
 import { startWeeklyEmailCron } from './services/emailCron.js';
 import { initWebPush } from './services/pushService.js';
+import initSocket from './socket.js';
 
 // Import routers
 import authRouter from './routes/auth.js';
@@ -14,6 +16,14 @@ import questionsRouter from './routes/questions.js';
 import interviewsRouter from './routes/interviews.js';
 import profileRouter from './routes/profile.js';
 import experiencesRouter from './routes/experiences.js';
+
+import { 
+  securityHeaders, 
+  sanitizeInputs, 
+  globalApiLimiter, 
+  authLimiter, 
+  aiGenerationLimiter 
+} from './middleware/security.js';
 
 // Load environment variables
 dotenv.config();
@@ -30,9 +40,27 @@ if (!process.env.TAVILY_API_KEY) {
 const app = express();
 const PORT = process.env.PORT || 5500;
 
-// Enable CORS and JSON parsing
-app.use(cors());
-app.use(express.json());
+// Wrap Express in a plain HTTP server so Socket.io (used for the optional
+// live-streamed interviewer reaction in the Mock Interview section) can
+// attach to the exact same port — no separate server/port needed.
+const httpServer = http.createServer(app);
+
+// 1. Apply Security Headers & CORS
+app.use(securityHeaders);
+app.use(cors({
+  origin: true,
+  credentials: true
+}));
+
+// 2. Request Body Payload Size Hardening (DoS protection)
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// 3. NoSQL Injection & Input Sanitization
+app.use(sanitizeInputs);
+
+// 4. Global API Rate Limiting (300 req / min per IP)
+app.use('/api', globalApiLimiter);
 
 // Request logger middleware
 app.use((req, res, next) => {
@@ -40,12 +68,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// Register REST endpoints
-app.use('/api/auth', authRouter);
+// Register REST endpoints with targeted rate limiting
+app.use('/api/auth', authLimiter, authRouter);
 app.use('/api/companies', companiesRouter);
 app.use('/api/roadmaps', roadmapsRouter);
-app.use('/api/questions', questionsRouter);
-app.use('/api/interviews', interviewsRouter);
+app.use('/api/questions', aiGenerationLimiter, questionsRouter);
+app.use('/api/interviews', aiGenerationLimiter, interviewsRouter);
 app.use('/api/profile', profileRouter);
 app.use('/api/experiences', experiencesRouter);
 
@@ -78,10 +106,16 @@ const startServer = async () => {
   initWebPush();
   startWeeklyEmailCron();
 
-  app.listen(PORT, () => {
+  // Attach Socket.io for the Mock Interview section's live interviewer
+  // reaction feature. Gracefully no-ops (frontend just won't show the
+  // live-reaction panel) if GROQ_API_KEY isn't configured — see socket.js.
+  initSocket(httpServer);
+
+  httpServer.listen(PORT, () => {
     console.log(`==================================================`);
     console.log(`THE_PlacementGRID Backend Running on Port ${PORT}`);
     console.log(`Mode: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`Socket.io: live interviewer reaction enabled`);
     console.log(`==================================================`);
   });
 };

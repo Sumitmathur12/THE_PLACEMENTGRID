@@ -307,6 +307,7 @@ function PeerChallengeTab({ user, token }) {
   const [scope, setScope] = useState('global'); // 'global' | 'target'
   const [period, setPeriod] = useState('weekly'); // 'weekly' | 'alltime'
   const [leaderboard, setLeaderboard] = useState([]);
+  const [badges, setBadges] = useState({});
   const [lbLoading, setLbLoading] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [handleInput, setHandleInput] = useState('');
@@ -340,6 +341,7 @@ function PeerChallengeTab({ user, token }) {
       const res = await fetch(url);
       const data = await res.json();
       setLeaderboard(data.leaderboard || []);
+      setBadges(data.badges || {});
     } catch (e) {
       console.error(e);
     } finally {
@@ -444,7 +446,17 @@ function PeerChallengeTab({ user, token }) {
           <div className="flex items-center gap-2 text-xs text-charcoal-900">
             <CheckCircle2 size={15} className="text-sage-500" />
             Playing as <strong>{myStats.displayHandle}</strong>
-            {myStats.globalRank && <span className="text-charcoal-500">· Global Rank #{myStats.globalRank}</span>}
+            {myStats.globalRank && (
+              <span className="text-charcoal-500 flex items-center gap-1">
+                · Global Rank #{myStats.globalRank}
+                {myStats.rankChange != null && myStats.rankChange !== 0 && (
+                  <span className={myStats.rankChange > 0 ? 'text-sage-600 font-bold' : 'text-red-500 font-bold'}>
+                    {myStats.rankChange > 0 ? `↑${myStats.rankChange}` : `↓${Math.abs(myStats.rankChange)}`}
+                  </span>
+                )}
+                {myStats.rankChange === 0 && <span className="text-charcoal-300">— unchanged</span>}
+              </span>
+            )}
           </div>
           <button
             onClick={() => setShowSettings(!showSettings)}
@@ -522,6 +534,20 @@ function PeerChallengeTab({ user, token }) {
         </div>
       </div>
 
+      {/* Achievement badges — genuine preparation signals, not volume/time-based */}
+      {(badges.weeklyChampion || badges.allTimeChampion || badges.mostConsistent || badges.questionCrusher || badges.mostImproved || (badges.roadmapFinishers && badges.roadmapFinishers.length > 0)) && (
+        <div className="flex flex-wrap gap-2">
+          {badges.weeklyChampion && <BadgeChip label="🏆 Weekly Champion" name={badges.weeklyChampion} />}
+          {badges.allTimeChampion && <BadgeChip label="🏆 All-Time Champion" name={badges.allTimeChampion} />}
+          {badges.mostConsistent && <BadgeChip label="🔥 Most Consistent" name={badges.mostConsistent} />}
+          {badges.questionCrusher && <BadgeChip label="📚 Question Crusher" name={badges.questionCrusher} />}
+          {badges.mostImproved && <BadgeChip label="📈 Most Improved" name={badges.mostImproved} />}
+          {badges.roadmapFinishers && badges.roadmapFinishers.map(name => (
+            <BadgeChip key={name} label="🎯 Roadmap Finisher" name={name} />
+          ))}
+        </div>
+      )}
+
       {/* Leaderboard table */}
       <div className="bg-cream-200 border border-cream-300 rounded-xl shadow-paper overflow-hidden overflow-x-auto">
         {lbLoading ? (
@@ -531,10 +557,11 @@ function PeerChallengeTab({ user, token }) {
             No one's on this board yet — be the first opted-in student here!
           </div>
         ) : (
-          <table className="w-full text-xs min-w-[480px]">
+          <table className="w-full text-xs min-w-[520px]">
             <thead>
               <tr className="border-b border-cream-300 text-charcoal-500 text-left">
                 <th className="px-4 py-3 font-semibold">#</th>
+                <th className="px-4 py-3 font-semibold"></th>
                 <th className="px-4 py-3 font-semibold">Student</th>
                 <th className="px-4 py-3 font-semibold">Target</th>
                 <th className="px-4 py-3 font-semibold text-right">Streak</th>
@@ -551,8 +578,15 @@ function PeerChallengeTab({ user, token }) {
                     className={`border-b border-cream-300/50 ${isMe ? 'bg-sage-100/60 font-semibold' : ''}`}
                   >
                     <td className="px-4 py-3 font-serif font-bold text-sage-600">#{entry.rank}</td>
+                    <td className="px-2 py-3 text-[10px]">
+                      {entry.rankChange != null && entry.rankChange > 0 && <span className="text-sage-600 font-bold">↑{entry.rankChange}</span>}
+                      {entry.rankChange != null && entry.rankChange < 0 && <span className="text-red-500 font-bold">↓{Math.abs(entry.rankChange)}</span>}
+                      {entry.rankChange === 0 && <span className="text-charcoal-300">—</span>}
+                    </td>
                     <td className="px-4 py-3 text-charcoal-900">{entry.displayHandle}{isMe && ' (You)'}</td>
-                    <td className="px-4 py-3 text-charcoal-500">{entry.targetCompany || '—'}</td>
+                    <td className="px-4 py-3 text-charcoal-500">
+                      {entry.targetCompany || '—'}{entry.targetRole ? ` · ${entry.targetRole}` : ''}
+                    </td>
                     <td className="px-4 py-3 text-right">
                       <span className="inline-flex items-center gap-1 text-terracotta-600">
                         <Flame size={11} className="fill-terracotta-500" />{entry.streak}
@@ -567,6 +601,15 @@ function PeerChallengeTab({ user, token }) {
           </table>
         )}
       </div>
+    </div>
+  );
+}
+
+function BadgeChip({ label, name }) {
+  return (
+    <div className="bg-white border border-cream-300 rounded-lg px-3 py-2 shadow-paper flex items-center gap-2">
+      <span className="text-[10px] font-semibold text-charcoal-500">{label}</span>
+      <span className="text-[10px] font-bold text-sage-600">{name}</span>
     </div>
   );
 }

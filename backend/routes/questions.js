@@ -1,6 +1,6 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
-import { Question, Attempt, SpacedRepetition } from '../models/Schemas.js';
+import { Question, Attempt, SpacedRepetition, User } from '../models/Schemas.js';
 import { calculateSM2 } from '../services/spacedRepetition.js';
 import { requireAuth } from './auth.js';
 import { sendPushNotification, getVapidPublicKey } from '../services/pushService.js';
@@ -18,20 +18,26 @@ router.get('/practice', requireAuth, async (req, res) => {
   if (numLimit < 15) numLimit = 15;
   if (numLimit > 20) numLimit = 20;
 
+  // Resolve category fallback if undefined
+  const validCategories = ['quant', 'logical', 'verbal', 'coreCS'];
+  const effectiveCategory = (category && validCategories.includes(category))
+    ? category 
+    : validCategories[Math.floor(Math.random() * validCategories.length)];
+
   try {
     const user = req.user;
     let excludedIds = user.attemptedQuestionIds || [];
     let query = {};
-    if (category) query.category = category;
+    if (effectiveCategory) query.category = effectiveCategory;
     if (company) query.companies = company;
 
     // 1. Fetch grounding reference from KnowledgeBase
     let groundingRefText = "";
     try {
-      const kbCategory = category === 'quant' ? 'quantFormulaReference' : 
-                         category === 'logical' ? 'logicalRulesReference' : 
-                         category === 'verbal' ? 'verbalRulesReference' : 
-                         category === 'coreCS' ? 'coreCSRulesReference' : null;
+      const kbCategory = effectiveCategory === 'quant' ? 'quantFormulaReference' : 
+                         effectiveCategory === 'logical' ? 'logicalRulesReference' : 
+                         effectiveCategory === 'verbal' ? 'verbalRulesReference' : 
+                         effectiveCategory === 'coreCS' ? 'coreCSRulesReference' : null;
       if (kbCategory) {
         const { KnowledgeBase } = await import('../models/Schemas.js');
         const refDoc = await KnowledgeBase.findOne({ category: kbCategory });
@@ -46,114 +52,128 @@ router.get('/practice', requireAuth, async (req, res) => {
     let questions = [];
     let liveGeneratedCount = 0;
     let fallbackCount = 0;
-    let attempts = 0;
 
-    // Prompt categories sub-topics spread
-    let subTopicsSpread = "";
-    if (category === 'quant') {
-      subTopicsSpread = `You MUST ensure sub-topic diversity. Generate 2 questions from each of these sub-topics:
-- Percentages
-- Profit & Loss
-- Time, Speed & Distance
-- Ratio & Proportion
-- Simple & Compound Interest
-- Time & Work
-- Averages
-- Permutations, Combinations & Probability`;
-    } else if (category === 'logical') {
-      subTopicsSpread = `You MUST ensure sub-topic diversity. Generate 2-3 questions from each of these sub-topics:
-- Syllogisms
-- Blood Relations
-- Coding-Decoding
-- Number/Letter Series
-- Direction Sense
-- Seating Arrangement`;
-    } else if (category === 'verbal') {
-      subTopicsSpread = `You MUST ensure sub-topic diversity. Generate 3-4 questions from each of these sub-topics:
-- Synonyms & Antonyms (with context clue)
-- Sentence Correction & Grammar
-- Reading Comprehension (short passage & question)
-- Idioms & Phrases`;
-    } else if (category === 'coreCS') {
-      subTopicsSpread = `You MUST ensure sub-topic diversity. Generate 3-4 questions from each of these sub-topics:
-- Operating Systems (scheduling, memory, deadlock)
-- Database Management Systems (SQL Joins, normalization, ACID)
-- Computer Networks (OSI layers, TCP/UDP, DNS)
-- Data Structures & Algorithms`;
+    // Sub-topic groupings for parallel fast generation (5 micro-batches of 3 questions each = 15 questions)
+    let subTopicBatches = [];
+    if (effectiveCategory === 'quant') {
+      subTopicBatches = [
+        "Percentages and Profit & Loss",
+        "Ratio, Proportion and Averages",
+        "Time Speed & Distance and Time & Work",
+        "Simple & Compound Interest",
+        "Permutations, Combinations & Probability"
+      ];
+    } else if (effectiveCategory === 'logical') {
+      subTopicBatches = [
+        "Syllogisms and Blood Relations",
+        "Coding-Decoding and Letter Series",
+        "Number Series and Analogy",
+        "Direction Sense and Distance",
+        "Seating Arrangement and Ordering"
+      ];
+    } else if (effectiveCategory === 'verbal') {
+      subTopicBatches = [
+        "Synonyms and Antonyms with context clues",
+        "Sentence Correction and Error Spotting",
+        "Reading Comprehension short passage questions",
+        "Idioms and Phrase Meanings",
+        "Para Jumbles and Sentence Completion"
+      ];
+    } else {
+      subTopicBatches = [
+        "Operating Systems: CPU scheduling and Deadlocks",
+        "DBMS: SQL Joins, Normalization, and ACID properties",
+        "Computer Networks: OSI layers and TCP/UDP protocols",
+        "Data Structures: Trees, Graphs, and Hash Tables",
+        "Algorithms: Sorting, Searching, and Time Complexity"
+      ];
     }
 
-    // Try live generation first
-    while (questions.length < numLimit && attempts < 3) {
-      attempts++;
-      const neededCount = numLimit - questions.length;
-      console.log(`[LLM GENERATION] Attempt ${attempts}: Generating ${neededCount} live questions for category: ${category}...`);
-      
+    console.log(`[LLM GENERATION] Running 5 parallel micro-batches for ${effectiveCategory} (3 questions each)...`);
+
+    const generateBatch = async (batchTopics, batchCount = 3) => {
       const systemPrompt = `You are THE_PlacementGRID AI question generator.
-Generate exactly ${neededCount} fresh, highly realistic, non-repeating aptitude questions of difficulty medium for category ${category || 'general'}.
+Generate exactly ${batchCount} multiple-choice aptitude questions for category '${effectiveCategory}' on: ${batchTopics}.
 
-VERIFIED REFERENCE GROUNDING (You MUST ensure all questions adhere strictly to these correct mathematical formulas and reasoning rules):
-${groundingRefText || 'Solve general placement questions.'}
+JSON ARRAY FORMAT ONLY (No markdown fences, no extra text):
+[
+  {
+    "text": "Question text here?",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "correctIndex": 0,
+    "subTopic": "${batchTopics.split(' ')[0]}",
+    "difficulty": "medium",
+    "category": "${effectiveCategory}"
+  }
+]`;
 
-SUB-TOPIC DIVERSITY REQUIREMENT:
-${subTopicsSpread}
-No repeating the same problem template or structure more than 2 times. Vary the scenario, variables, and wording.
+      const userPrompt = `Generate ${batchCount} distinct MCQs on: ${batchTopics}. Output valid JSON array.`;
+      const responseText = await generateLLMResponse(systemPrompt, userPrompt);
+      if (!responseText) return [];
 
-STRICT OPTION RULE:
-For each question, generate exactly 4 options. All 4 option texts MUST be distinct. Distractors should be common calculation/logic errors.
-
-SELF-VERIFICATION STEP:
-You must solve the question yourself step-by-step to verify option correctness.
-Explain this reasoning in the 'verificationReasoning' field.
-
-STRICT FORMATTING DIRECTIVES:
-- Respond with pure valid JSON array only. No markdown fences or backticks.
-Each object must have:
-- text: string
-- options: array of 4 strings
-- correctIndex: number (0-3)
-- subTopic: string (e.g. 'Percentages')
-- difficulty: string ('easy', 'medium', 'hard')
-- category: string ('quant', 'logical', 'verbal', 'coreCS')
-- verificationReasoning: string (step-by-step verification)
-`;
+      const cleanedText = responseText.replace(/```json|```/gi, '').trim();
+      let parsed = [];
 
       try {
-        const responseText = await generateLLMResponse(systemPrompt, `Generate ${neededCount} questions now.`);
-        const cleanedText = responseText.replace(/```json|```/gi, '').trim();
-        const generatedList = JSON.parse(cleanedText);
-
-        if (Array.isArray(generatedList)) {
-          const validated = [];
-          for (const item of generatedList) {
-            if (!item.options || !Array.isArray(item.options) || item.options.length !== 4) continue;
-            const uniqueOptions = new Set(item.options.map(o => String(o).trim()));
-            if (uniqueOptions.size !== 4) continue;
-
-            // Pattern diversity check: check if we already have too many questions of this subtopic in this session
-            const subTopicCount = validated.filter(q => q.subTopic === item.subTopic).length + questions.filter(q => q.subTopic === item.subTopic).length;
-            if (subTopicCount >= 3) {
-              console.log(`[DIVERSITY CHECK REJECT] Discarding duplicate template question for subTopic: ${item.subTopic}`);
-              continue;
-            }
-
-            // Save question to DB to get an ID for submission/bookmarking
-            const q = await Question.create({
-              category: item.category || category || 'quant',
-              text: item.text,
-              options: item.options,
-              correctIndex: item.correctIndex,
-              difficulty: item.difficulty || 'medium',
-              subTopic: item.subTopic || 'general',
-              origin: 'AI-generated'
-            });
-            validated.push(q);
-            liveGeneratedCount++;
-          }
-          questions = [...questions, ...validated];
+        const jsonMatch = cleanedText.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          parsed = JSON.parse(jsonMatch[0]);
+        } else {
+          parsed = JSON.parse(cleanedText);
         }
       } catch (err) {
-        console.error(`Attempt ${attempts} failed:`, err.message);
+        // Resilient object-level fallback recovery
+        const objectMatches = cleanedText.match(/\{[\s\S]*?"text"[\s\S]*?"options"[\s\S]*?"correctIndex"[\s\S]*?\}/g) || [];
+        for (const objStr of objectMatches) {
+          try {
+            const sanitized = objStr.replace(/,\s*([}\]])/g, '$1');
+            const item = JSON.parse(sanitized);
+            if (item && item.text && Array.isArray(item.options) && item.options.length === 4) {
+              parsed.push(item);
+            }
+          } catch (_) {}
+        }
       }
+
+      return Array.isArray(parsed) ? parsed : [];
+    };
+
+    // Run 5 micro-batches concurrently for ultra-fast generation (< 1.5s total)
+    const batchResults = await Promise.allSettled(
+      subTopicBatches.map(topics => generateBatch(topics, 3))
+    );
+
+    const rawGenerated = [];
+    for (const res of batchResults) {
+      if (res.status === 'fulfilled' && Array.isArray(res.value)) {
+        rawGenerated.push(...res.value);
+      }
+    }
+
+    // Validate and save generated questions to DB
+    for (const item of rawGenerated) {
+      if (!item.text || !item.options || !Array.isArray(item.options) || item.options.length !== 4) continue;
+      const uniqueOpts = new Set(item.options.map(o => String(o).trim()));
+      if (uniqueOpts.size !== 4) continue;
+      if (typeof item.correctIndex !== 'number' || item.correctIndex < 0 || item.correctIndex > 3) continue;
+
+      try {
+        const q = await Question.create({
+          category: item.category || effectiveCategory,
+          text: item.text,
+          options: item.options,
+          correctIndex: item.correctIndex,
+          difficulty: item.difficulty || 'medium',
+          subTopic: item.subTopic || 'General Aptitude',
+          origin: 'AI-generated'
+        });
+        questions.push(q);
+        liveGeneratedCount++;
+      } catch (dbErr) {
+        console.warn('Failed to insert AI practice question to DB:', dbErr.message);
+      }
+
+      if (questions.length >= numLimit) break;
     }
 
     // 2. Database Fallback (last-resort only)

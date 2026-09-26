@@ -1,722 +1,1485 @@
-import React, { useEffect, useState, useRef } from 'react';
-import { ShieldAlert, Play, Square, Mic, Volume2, Award, ClipboardList, Loader2, AlertCircle } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Briefcase, FileText, Sliders, Sparkles, Loader2, ChevronRight, ChevronLeft,
+  Check, Clock, Mic, MicOff, Send, Volume2, VolumeX, MessageSquare, RotateCcw,
+  CheckCircle, ThumbsUp, Target, Lightbulb, Trophy, AlertCircle,
+  BookOpen, SkipForward, Shield
+} from 'lucide-react';
+import { io } from 'socket.io-client';
 import CameraProctor from '../components/CameraProctor.jsx';
-import AIAvatar from '../components/AIAvatar.jsx';
+
+const STEPS = ['Job Details', 'Preferences', 'Resume', 'Review'];
+
+const EXPERIENCE_LEVELS = [
+  { value: 'entry',     label: 'Entry Level',  sub: '0–2 years' },
+  { value: 'mid',       label: 'Mid Level',    sub: '3–5 years' },
+  { value: 'senior',    label: 'Senior',       sub: '5–8 years' },
+  { value: 'lead',      label: 'Lead / Staff', sub: '8+ years'  },
+  { value: 'executive', label: 'Executive',    sub: 'C-Suite'   },
+];
+
+const QUESTION_TYPES = [
+  { value: 'technical',   label: 'Technical' },
+  { value: 'behavioral',  label: 'Behavioral' },
+  { value: 'situational', label: 'Situational' },
+  { value: 'hr',          label: 'HR' },
+  { value: 'culture_fit', label: 'Culture Fit' },
+];
 
 export default function MockInterviewPage({ user, token }) {
-  const [targetCompany, setTargetCompany] = useState(user?.targetCompany || 'Google');
-  const [interviewStarted, setInterviewStarted] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [view, setView] = useState('wizard');
+  const [wizardStep, setWizardStep] = useState(0);
+
+  // Wizard Form State
+  const [jobTitle, setJobTitle] = useState('');
+  const [company, setCompany] = useState(user?.targetCompany || '');
+  const [jobDescription, setJobDescription] = useState('');
+  const [experienceLevel, setExperienceLevel] = useState('mid');
+  const [selectedTypes, setSelectedTypes] = useState(['technical', 'behavioral']);
+  const [numberOfQuestions, setNumberOfQuestions] = useState(5);
+  const [useResume, setUseResume] = useState(false);
+
+  // Session-specific resume upload (PDF/DOCX, does NOT overwrite profile)
+  const [sessionResumeFile, setSessionResumeFile] = useState(null);
+  const [sessionResumeContext, setSessionResumeContext] = useState(null);
+  const [resumeUploading, setResumeUploading] = useState(false);
+  const [resumeUploadStatus, setResumeUploadStatus] = useState(null); // 'success' | 'error' | null
+  const resumeFileInputRef = useRef(null);
+
+  // Company Verification State
+  const [companyVerification, setCompanyVerification] = useState(null);
+  const [verifyingCompany, setVerifyingCompany] = useState(false);
+
+  // Loading & Error States
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [generationStage, setGenerationStage] = useState('');
+  const [errorMessage, setErrorMessage] = useState('');
+
+  // Active Session State
   const [sessionId, setSessionId] = useState(null);
-  
-  // Permission management
-  const [permissionsGranted, setPermissionsGranted] = useState(false);
-  const [permissionError, setPermissionError] = useState(null);
-  const [requestingPerms, setRequestingPerms] = useState(false);
-
-  // State Machine: 'idle' | 'ai_speaking' | 'listening' | 'processing'
-  const [avatarState, setAvatarState] = useState('idle');
-
-  // Speech & questions
   const [questions, setQuestions] = useState([]);
-  const [currentQIdx, setCurrentQIdx] = useState(0);
-  const [verbalTranscript, setVerbalTranscript] = useState('');
-  const [isRecording, setIsRecording] = useState(false);
+  const [currentIdx, setCurrentIdx] = useState(0);
+  const [answerText, setAnswerText] = useState('');
+  const [rawTranscriptText, setRawTranscriptText] = useState('');
+  const [savedAnswers, setSavedAnswers] = useState({});
+  const [submitting, setSubmitting] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [startTime, setStartTime] = useState(Date.now());
   const [proctorLogs, setProctorLogs] = useState([]);
+  const [showProctor, setShowProctor] = useState(false);
 
-  // Final review report
-  const [evaluation, setEvaluation] = useState(null);
+  // Explicit Interview State Machine:
+  // 'READY_TO_ANSWER' | 'QUESTION_READING' | 'RECORDING' | 'REVIEWING' | 'SUBMITTING' | 'FOLLOW_UP' | 'COMPLETED'
+  const [interviewState, setInterviewState] = useState('READY_TO_ANSWER');
+  const [interimTranscript, setInterimTranscript] = useState('');
 
-  // References for Web Speech API & Web Audio
-  const recognitionRef = useRef(null);
-  const synthRef = window.speechSynthesis;
+  // Results State
+  const [sessionResults, setSessionResults] = useState(null);
+  const [expandedAnswerIdx, setExpandedAnswerIdx] = useState(null);
+
+  // Audio State
+  const [isSpeaking, setIsSpeaking] = useState(false);
   const audioRef = useRef(null);
-  const audioCtxRef = useRef(null);
-  const micStreamRef = useRef(null);
-  const analyserRef = useRef(null);
-  const animationFrameIdRef = useRef(null);
+  const synthRef = typeof window !== 'undefined' ? window.speechSynthesis : null;
 
-  // Initialize Speech Recognition
-  const initSpeechRecognition = () => {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      console.warn('Speech recognition not supported in this browser.');
-      return;
-    }
-    const recognition = new SpeechRecognition();
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.lang = 'en-IN'; // Optimized for Indian-accented English
+  // Speech Recognition State & Refs
+  const [isListening, setIsListening] = useState(false);
+  const recognitionRef = useRef(null);
+  const isListeningRef = useRef(false);
+  const explicitStopRef = useRef(false);
+  const baseAnswerRef = useRef('');
 
-    recognition.onstart = () => {
-      setIsRecording(true);
-      setVerbalTranscript('Listening... Speak clearly.');
-    };
-
-    recognition.onresult = (event) => {
-      const text = event.results[0][0].transcript;
-      setVerbalTranscript(text);
-    };
-
-    recognition.onerror = (event) => {
-      console.error('Speech recognition error:', event.error);
-      setIsRecording(false);
-      setVerbalTranscript('Failed to capture speech. Please type your answer below.');
-      setAvatarState('listening'); // Keep state as listening so they can type
-    };
-
-    recognition.onend = () => {
-      setIsRecording(false);
-    };
-
-    recognitionRef.current = recognition;
-  };
+  // Socket.io Live Streaming State (REACTION only — never affects question flow)
+  const [socket, setSocket] = useState(null);
+  const [liveReaction, setLiveReaction] = useState('');
+  const [isStreamingReaction, setIsStreamingReaction] = useState(false);
 
   useEffect(() => {
-    initSpeechRecognition();
-    // Stop any speaking on page unmount
-    return () => {
-      if (synthRef) synthRef.cancel();
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current.src = '';
+    const socketUrl = window.location.hostname === 'localhost' ? 'http://localhost:5500' : window.location.origin;
+    const s = io(socketUrl, { transports: ['websocket', 'polling'] });
+    setSocket(s);
+
+    s.on('ai_chunk', (payload) => {
+      const content = typeof payload === 'string' ? payload : payload?.content || '';
+      if (payload?.type === 'REACTION' || typeof payload === 'string') {
+        setLiveReaction((prev) => prev + content);
       }
-      stopBargeInDetection();
+    });
+
+    s.on('ai_complete', (payload) => {
+      if (!payload || payload?.type === 'REACTION') {
+        setIsStreamingReaction(false);
+      }
+    });
+
+    s.on('ai_error', (err) => {
+      setIsStreamingReaction(false);
+      console.warn('Socket reaction error:', err);
+    });
+
+    return () => {
+      s.disconnect();
     };
   }, []);
 
-  // Request camera and microphone permissions gracefully
-  const requestMediaPermissions = async () => {
-    setPermissionError(null);
-    setRequestingPerms(true);
-    try {
-      console.log('Requesting webcam and audio permissions...');
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-      // Stop tracks immediately to avoid keeping hardware active
-      stream.getTracks().forEach(track => track.stop());
-      setPermissionsGranted(true);
-      return true;
-    } catch (err) {
-      console.warn('Media permissions rejected:', err.name, err.message);
-      let errMsg = 'Failed to access camera and microphone. Please check system settings.';
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        errMsg = 'Permission denied. Please click the camera icon in your URL bar and allow access to continue.';
-      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-        errMsg = 'No webcam or microphone device detected on this system.';
-      } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
-        errMsg = 'Webcam or microphone is currently in use by another application (e.g. Zoom, Teams, or another tab). Please close other software and try again.';
-      }
-      setPermissionError(errMsg);
-      setPermissionsGranted(false);
-      return false;
-    } finally {
-      setRequestingPerms(false);
-    }
-  };
-
-  // Fallback native speech synthesis in case backend proxy fails or key is missing
-  const fallbackSpeakQuestion = (text) => {
-    if (!synthRef) {
-      setAvatarState('listening');
-      return;
-    }
-    
-    synthRef.cancel();
-    setAvatarState('ai_speaking');
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    const voices = synthRef.getVoices();
-    const indVoice = voices.find(v => v.lang.includes('en-IN') || v.lang.includes('en_IN'));
-    if (indVoice) {
-      utterance.voice = indVoice;
-    }
-    
-    utterance.rate = 0.95; // Clear pace
-
-    utterance.onend = () => {
-      activateMicrophoneForAnswer();
-    };
-
-    utterance.onerror = (e) => {
-      console.error('Fallback native TTS error:', e);
-      activateMicrophoneForAnswer();
-    };
-
-    synthRef.speak(utterance);
-  };
-
-  // Text-To-Speech (TTS): Speaks question aloud using Sarvam AI Bulbul model
-  const speakQuestion = async (text) => {
-    // 1. Reset any running sound
-    synthRef?.cancel();
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current.src = '';
-    }
-    stopBargeInDetection();
-
-    setAvatarState('ai_speaking');
-
-    try {
-      const res = await fetch('/api/interviews/tts', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({ text })
-      });
-
-      if (!res.ok) throw new Error(`HTTP Error status ${res.status}`);
-      const data = await res.json();
-
-      if (data.audioContent) {
-        console.log('Playing Sarvam AI Bulbul voice model TTS...');
-        const audio = new Audio(`data:audio/wav;base64,${data.audioContent}`);
-        audioRef.current = audio;
-
-        audio.onended = () => {
-          stopBargeInDetection();
-          activateMicrophoneForAnswer();
-        };
-
-        audio.onerror = (e) => {
-          console.error('HTML5 audio play failed, falling back to native TTS:', e);
-          fallbackSpeakQuestion(text);
-        };
-
-        await audio.play();
-
-        // Start monitoring mic stream for barge-in interruptions
-        startBargeInDetection();
-      } else {
-        console.warn('Sarvam TTS key not configured or failed, falling back to native browser TTS');
-        fallbackSpeakQuestion(text);
-      }
-    } catch (err) {
-      console.warn('Sarvam API call failed, falling back to browser TTS:', err.message);
-      fallbackSpeakQuestion(text);
-    }
-  };
-
-  // Web Audio AnalyserNode monitoring for voice Barge-In
-  const startBargeInDetection = async () => {
-    stopBargeInDetection(); // ensure clean state
-    
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      micStreamRef.current = stream;
-
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      const audioCtx = new AudioContextClass();
-      audioCtxRef.current = audioCtx;
-
-      const source = audioCtx.createMediaStreamSource(stream);
-      const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 256;
-      analyserRef.current = analyser;
-      source.connect(analyser);
-
-      const bufferLength = analyser.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-
-      // Sensitivity settings: Speak threshold set to 65 (of 255)
-      // Laptop speakers echo protection: Counter tracks sustained voice activity
-      const speakThreshold = 65; 
-      let speakCounter = 0;
-
-      const monitorMic = () => {
-        if (!analyserRef.current) return;
-        analyser.getByteFrequencyData(dataArray);
-
-        // Find max peak amplitude in frequency band
-        let maxVal = 0;
-        for (let i = 0; i < bufferLength; i++) {
-          if (dataArray[i] > maxVal) {
-            maxVal = dataArray[i];
+  useEffect(() => {
+    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRec) {
+      const rec = new SpeechRec();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.onresult = (e) => {
+        let interimText = '';
+        let finalChunk = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          if (e.results[i].isFinal) {
+            finalChunk += e.results[i][0].transcript;
+          } else {
+            interimText += e.results[i][0].transcript;
           }
         }
-
-        if (maxVal > speakThreshold) {
-          speakCounter++;
-          // Trigger barge-in if voice is sustained for ~160ms (10 frames)
-          if (speakCounter > 8) {
-            console.log('Barge-in: Mic input voice detected! Halting AI playback.');
-            handleBargeInInterruption();
-            return;
+        setInterimTranscript(interimText);
+        if (finalChunk) {
+          setRawTranscriptText((prev) => {
+            const trimmed = prev.trimEnd();
+            const updated = trimmed ? `${trimmed} ${finalChunk.trim()}` : finalChunk.trim();
+            const base = (baseAnswerRef.current || '').trim();
+            const normalizedChunk = normalizeTranscript(updated);
+            const combined = base ? `${base} ${normalizedChunk}` : normalizedChunk;
+            setAnswerText(combined);
+            return updated;
+          });
+        }
+      };
+      rec.onerror = (e) => {
+        if (e.error !== 'no-speech' && e.error !== 'aborted') {
+          console.warn('Speech recognition error:', e.error);
+        }
+      };
+      rec.onend = () => {
+        // If recording is still active and user did not click Stop, keep listening (handles pauses)
+        if (isListeningRef.current && !explicitStopRef.current) {
+          try {
+            rec.start();
+          } catch (_) {
+            setIsListening(false);
+            isListeningRef.current = false;
           }
         } else {
-          speakCounter = Math.max(0, speakCounter - 1);
+          setIsListening(false);
+          isListeningRef.current = false;
         }
+      };
+      recognitionRef.current = rec;
+    }
+  }, []);
 
-        animationFrameIdRef.current = requestAnimationFrame(monitorMic);
+
+  useEffect(() => {
+    if (view !== 'session') return;
+    const interval = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startTime) / 1000));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [view, startTime]);
+
+  const formatTime = (s) => {
+    const mins = Math.floor(s / 60);
+    const secs = s % 60;
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  };
+
+  const toggleType = (type) => {
+    setSelectedTypes((prev) =>
+      prev.includes(type)
+        ? prev.length > 1 ? prev.filter((t) => t !== type) : prev
+        : [...prev, type]
+    );
+  };
+
+  const canProceedWizard = () => {
+    if (wizardStep === 0) {
+      return jobTitle.trim().length > 0 && jobDescription.trim().length >= 50;
+    }
+    return true;
+  };
+
+  const handleStartInterview = async () => {
+    setIsGenerating(true);
+    setErrorMessage('');
+    setGenerationStage(`Analyzing ${jobTitle || 'role'} requirements...`);
+
+    const stageInterval = setInterval(() => {
+      setGenerationStage((prev) => {
+        if (prev.includes('Analyzing')) return `Grounding in ${company || 'industry'} context...`;
+        if (prev.includes('Grounding')) return 'Structuring technical and behavioral questions...';
+        if (prev.includes('Structuring')) return 'Finalizing rubric and scoring points...';
+        return 'Finalizing your personalized interview set...';
+      });
+    }, 2200);
+
+    try {
+      const resumeSkills = user?.resume?.skills || [];
+      const resumeProjects = (user?.resume?.projects || []).map(p => `${p.title}: ${p.description || ''}`).join('; ');
+      const candidateProfile = useResume && (resumeSkills.length > 0 || resumeProjects)
+        ? `Skills: ${resumeSkills.join(', ')}. Projects: ${resumeProjects}.`
+        : '';
+
+      const body = {
+        jobTitle: jobTitle.trim(),
+        company: company.trim() || 'General Tech',
+        jobDescription: jobDescription.trim(),
+        experienceLevel,
+        questionTypes: selectedTypes,
+        numberOfQuestions,
+        resumeText: candidateProfile
       };
 
-      animationFrameIdRef.current = requestAnimationFrame(monitorMic);
-    } catch (e) {
-      console.warn('Mic barge-in monitor initialize bypassed:', e.message);
-    }
-  };
-
-  const stopBargeInDetection = () => {
-    if (animationFrameIdRef.current) {
-      cancelAnimationFrame(animationFrameIdRef.current);
-      animationFrameIdRef.current = null;
-    }
-    if (audioCtxRef.current) {
-      if (audioCtxRef.current.state !== 'closed') {
-        audioCtxRef.current.close();
+      // If user uploaded a session-specific resume, attach its parsed context
+      if (sessionResumeContext) {
+        body.resumeContext = sessionResumeContext;
       }
-      audioCtxRef.current = null;
-    }
-    if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach(track => track.stop());
-      micStreamRef.current = null;
-    }
-    analyserRef.current = null;
-  };
 
-  const handleBargeInInterruption = () => {
-    stopBargeInDetection();
-
-    // 1. Immediately halt audio streams
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current.src = '';
-    }
-    synthRef?.cancel();
-
-    // 2. Acknowledge user interruption and transition to listening immediately
-    setAvatarState('listening');
-    setVerbalTranscript('Listening... Speak your answer now.');
-
-    // 3. Trigger Web Speech Recognition recording
-    if (recognitionRef.current && !isRecording) {
-      try {
-        recognitionRef.current.start();
-      } catch (e) {
-        console.warn('Recognition failed to start on barge-in:', e.message);
-      }
-    }
-  };
-
-  const activateMicrophoneForAnswer = () => {
-    setAvatarState('listening');
-    if (recognitionRef.current && !isRecording) {
-      try {
-        recognitionRef.current.start();
-      } catch (e) {
-        console.warn('Recognition start failed:', e.message);
-      }
-    }
-  };
-
-  // Launch Session
-  const handleStartInterview = async () => {
-    // 1. Enforce media permission check
-    if (!permissionsGranted) {
-      const allowed = await requestMediaPermissions();
-      if (!allowed) return;
-    }
-
-    setLoading(true);
-    setEvaluation(null);
-    setProctorLogs([]);
-    setCurrentQIdx(0);
-    setVerbalTranscript('');
-    setAvatarState('processing');
-    
-    try {
       const res = await fetch('/api/interviews/start', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({ company: targetCompany })
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify(body)
       });
+
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to start interview');
 
       setSessionId(data.sessionId);
       setQuestions(data.questions || []);
-      setInterviewStarted(true);
-      
-      // Speak the first question aloud
-      setTimeout(() => {
-        speakQuestion(data.firstQuestion);
-      }, 800);
+      setCurrentIdx(0);
+      setAnswerText('');
+      setRawTranscriptText('');
+      setInterimTranscript('');
+      setInterviewState('READY_TO_ANSWER');
+      setSavedAnswers({});
+      setElapsed(0);
+      setStartTime(Date.now());
+      setLiveReaction('');
+      setIsStreamingReaction(false);
+      setShowProctor(true); // Auto-activate proctoring when interview begins
+      setView('session');
 
-    } catch (e) {
-      alert(e.message);
-      setAvatarState('idle');
+      if (data.questions?.[0]?.questionText) {
+        speakQuestionText(data.questions[0].questionText);
+      }
+    } catch (err) {
+      setErrorMessage(err.message || 'Error generating interview questions.');
     } finally {
-      setLoading(false);
+      clearInterval(stageInterval);
+      setIsGenerating(false);
+      setGenerationStage('');
     }
   };
 
-  // Record Answer manual toggle
-  const toggleRecording = () => {
-    if (!recognitionRef.current) {
-      alert('Speech recognition is not supported in this browser. Please type your answer.');
+  // Technical term normalization dictionary (spoken → written form)
+  const TECH_NORMALIZATION = {
+    'use state': 'useState', 'use effect': 'useEffect', 'use callback': 'useCallback',
+    'use memo': 'useMemo', 'use ref': 'useRef', 'use context': 'useContext',
+    'use reducer': 'useReducer', 'next j s': 'Next.js', 'next js': 'Next.js',
+    'react j s': 'React.js', 'node j s': 'Node.js', 'type script': 'TypeScript',
+    'java script': 'JavaScript', 'kubernetes': 'Kubernetes', 'docker': 'Docker',
+    'mongo d b': 'MongoDB', 'mongo db': 'MongoDB', 'my s q l': 'MySQL',
+    'postgre s q l': 'PostgreSQL', 'rest api': 'REST API', 'graphql': 'GraphQL',
+    'g r p c': 'gRPC', 'c i c d': 'CI/CD', 'aws': 'AWS', 'gcp': 'GCP',
+    'v i t e': 'Vite', 'web pack': 'Webpack', 'redis': 'Redis', 'kafka': 'Kafka',
+  };
+
+  const normalizeTranscript = (raw) => {
+    if (!raw) return raw;
+    let normalized = raw;
+    // Handle compound self-corrections: "X... actually sorry, Y" or "X... no wait, Y" → keep Y
+    normalized = normalized.replace(/[\w\s]+\.{2,3}\s*(?:(?:actually|sorry|i mean|i meant|no wait)[\s,]*)+\s*/gi, '');
+    // Apply tech term normalization
+    Object.entries(TECH_NORMALIZATION).forEach(([spoken, written]) => {
+      const re = new RegExp(spoken, 'gi');
+      normalized = normalized.replace(re, written);
+    });
+    return normalized.trim();
+  };
+
+  // Company verification trigger (called when company field changes and user leaves Step 0)
+  const handleVerifyCompany = async (companyName) => {
+    if (!companyName || !companyName.trim() || companyName.toLowerCase() === 'general tech') {
+      setCompanyVerification(null);
       return;
     }
-
-    if (isRecording) {
-      recognitionRef.current.stop();
-      setAvatarState('listening');
-    } else {
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current.src = '';
-      }
-      synthRef?.cancel();
-      stopBargeInDetection();
-      
-      setAvatarState('listening');
-      try {
-        recognitionRef.current.start();
-      } catch (e) {
-        console.warn('Manual record trigger failed:', e.message);
-      }
+    setVerifyingCompany(true);
+    try {
+      const res = await fetch('/api/interviews/verify-company', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ companyName: companyName.trim() })
+      });
+      const data = await res.json();
+      if (res.ok) setCompanyVerification(data);
+    } catch (err) {
+      console.warn('Company verification failed:', err.message);
+    } finally {
+      setVerifyingCompany(false);
     }
   };
 
-  // Submit Answer flow
-  const handleNextAnswerSubmit = async () => {
-    if (isRecording && recognitionRef.current) {
-      recognitionRef.current.stop();
+  // Session resume upload (PDF or DOCX) — does NOT overwrite user profile
+  const handleSessionResumeUpload = async (file) => {
+    if (!file) return;
+    if (!token) {
+      setResumeUploadStatus('error');
+      return;
     }
-    stopBargeInDetection();
+    const ext = file.name.split('.').pop().toLowerCase();
+    if (!['pdf', 'docx', 'doc'].includes(ext)) {
+      setResumeUploadStatus('error');
+      return;
+    }
+    setSessionResumeFile(file);
+    setResumeUploading(true);
+    setResumeUploadStatus(null);
+    try {
+      const formData = new FormData();
+      formData.append('resume', file);
+      const res = await fetch('/api/interviews/parse-resume', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body: formData
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setSessionResumeContext(data.resumeContext);
+        setResumeUploadStatus('success');
+      } else {
+        setResumeUploadStatus('error');
+        // Show error inline — no browser alert()
+        console.warn('Resume parse error:', data.error || 'Resume parsing failed.');
+      }
+    } catch (err) {
+      setResumeUploadStatus('error');
+      console.error('Resume upload error:', err.message);
+    } finally {
+      setResumeUploading(false);
+    }
+  };
 
-    setLoading(true);
-    setAvatarState('processing');
+  const stopAllAudio = () => {
+    if (audioRef.current) {
+      audioRef.current.onended = null;
+      audioRef.current.onerror = null;
+      audioRef.current.pause();
+      audioRef.current.src = '';
+      audioRef.current = null;
+    }
+    if (synthRef) {
+      synthRef.cancel();
+    }
+    setIsSpeaking(false);
+    setInterviewState((prev) => (prev === 'QUESTION_READING' ? 'READY_TO_ANSWER' : prev));
+  };
 
-    const isLast = currentQIdx === questions.length - 1;
-    const currentQuestionText = questions[currentQIdx];
+  const fallbackBrowserSpeak = (text) => {
+    if (!synthRef) {
+      setIsSpeaking(false);
+      setInterviewState((prev) => (prev === 'QUESTION_READING' ? 'READY_TO_ANSWER' : prev));
+      return;
+    }
+    synthRef.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 0.95;
+    utterance.pitch = 1.0;
+    utterance.onend = () => {
+      setIsSpeaking(false);
+      setInterviewState((prev) => (prev === 'QUESTION_READING' ? 'READY_TO_ANSWER' : prev));
+    };
+    utterance.onerror = () => {
+      setIsSpeaking(false);
+      setInterviewState((prev) => (prev === 'QUESTION_READING' ? 'READY_TO_ANSWER' : prev));
+    };
+    synthRef.speak(utterance);
+  };
+
+  const speakQuestionText = async (text) => {
+    if (!text) return;
+    stopAllAudio();
+    setIsSpeaking(true);
+    setInterviewState('QUESTION_READING');
+
+    try {
+      const res = await fetch('/api/interviews/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ text })
+      });
+
+      const data = await res.json();
+      if (data.audioContent && !data.isFallback) {
+        const audio = new Audio(`data:audio/mpeg;base64,${data.audioContent}`);
+        audioRef.current = audio;
+        audio.onended = () => {
+          setIsSpeaking(false);
+          audioRef.current = null;
+          setInterviewState((prev) => (prev === 'QUESTION_READING' ? 'READY_TO_ANSWER' : prev));
+        };
+        audio.onerror = () => {
+          if (audioRef.current === audio) {
+            fallbackBrowserSpeak(text);
+          }
+        };
+        await audio.play();
+      } else {
+        fallbackBrowserSpeak(text);
+      }
+    } catch (err) {
+      console.warn('TTS failed, using browser speech fallback:', err.message);
+      fallbackBrowserSpeak(text);
+    }
+  };
+
+  const toggleSpeakCurrentQuestion = () => {
+    if (isSpeaking) {
+      stopAllAudio();
+    } else {
+      const q = questions[currentIdx]?.questionText;
+      if (q) speakQuestionText(q);
+    }
+  };
+
+  // ==========================================================================
+  // Two-stage Voice Input Pipeline (Microphone ONLY — NEVER calls TTS or auto-submits)
+  // ==========================================================================
+  const startVoiceAnswer = (mode = 'append') => {
+    if (!recognitionRef.current) {
+      setErrorMessage('Speech recognition is not supported in your browser. Please use Chrome or Edge.');
+      return;
+    }
+    // 1. Strictly isolate: stop any playing question audio without triggering error fallback
+    stopAllAudio();
+
+    // 2. Set recording state
+    explicitStopRef.current = false;
+    isListeningRef.current = true;
+    setIsListening(true);
+    setInterviewState('RECORDING');
+    setInterimTranscript('');
+
+    if (mode === 'clear') {
+      baseAnswerRef.current = '';
+      setRawTranscriptText('');
+      setAnswerText('');
+    } else {
+      // Retain existing text as the base so new speech appends seamlessly without wiping previous text!
+      baseAnswerRef.current = (answerText || '').trim();
+      setRawTranscriptText('');
+    }
+
+    try {
+      recognitionRef.current.start();
+    } catch (err) {
+      console.warn('Mic start error:', err);
+    }
+  };
+
+  const stopVoiceAnswer = () => {
+    explicitStopRef.current = true;
+    isListeningRef.current = false;
+    setIsListening(false);
+
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (_) {}
+    }
+
+    setInterviewState('REVIEWING');
+    // Normalize self-corrections and technical terminology for the candidate to review
+    const raw = (rawTranscriptText || interimTranscript || '').trim();
+    const normalized = normalizeTranscript(raw);
+    const base = (baseAnswerRef.current || '').trim();
+
+    if (normalized) {
+      const combined = base ? `${base} ${normalized}` : normalized;
+      setAnswerText(combined);
+    }
+  };
+
+  // Submit answer & get evaluation + live reaction + conditional follow-up
+  const handleSubmitAnswer = async (skipped = false) => {
+    stopAllAudio();
+    if (isListening) {
+      stopVoiceAnswer();
+    }
+
+    const currentQ = questions[currentIdx];
+    if (!currentQ || !sessionId) return;
+
+    const finalAnswer = skipped ? 'Skipped question' : (answerText || '').trim();
+    const finalRaw = skipped ? '' : (rawTranscriptText || answerText || '').trim();
+    const finalNormalized = skipped ? '' : normalizeTranscript(rawTranscriptText || answerText || '').trim();
+
+    setSubmitting(true);
+    setInterviewState('SUBMITTING');
+
+    // Automatically trigger live Socket.io reaction for submitted real answers
+    if (!skipped && socket && finalAnswer.length >= 5) {
+      setLiveReaction('');
+      setIsStreamingReaction(true);
+      socket.emit('live_answer', {
+        sessionId,
+        questionId: currentQ._id || currentIdx,
+        questionText: currentQ.questionText,
+        answerText: finalAnswer,
+        expectedKeywords: currentQ.expectedKeywords || [],
+        companyName: company || 'Tech Company'
+      });
+    }
 
     try {
       const res = await fetch('/api/interviews/submit-answer', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
         body: JSON.stringify({
           sessionId,
-          question: currentQuestionText,
-          answer: verbalTranscript || '(No answer provided)',
-          proctorLogs, // sends tab-switch/no-face triggers gathered so far
-          isLast
+          question: currentQ.questionText,
+          answer: finalAnswer,
+          rawTranscript: finalRaw,
+          normalizedTranscript: finalNormalized,
+          expectedKeywords: currentQ.expectedKeywords || [],
+          questionIndex: currentIdx,
+          proctorLogs: proctorLogs
         })
       });
 
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to submit response');
+      if (!res.ok) throw new Error(data.error || 'Failed to submit answer');
 
-      if (isLast) {
-        // Reset state, close camera, show feedback evaluation
-        setInterviewStarted(false);
-        setEvaluation(data.session?.feedback || { score: 75 });
-        setAvatarState('idle');
-      } else {
-        // Proceed to next question
-        const nextIdx = currentQIdx + 1;
-        setCurrentQIdx(nextIdx);
-        setVerbalTranscript('');
-        
-        // Speak next question
-        setTimeout(() => {
-          speakQuestion(questions[nextIdx]);
-        }, 800);
+      setSavedAnswers((prev) => ({
+        ...prev,
+        [currentIdx]: {
+          answer: finalAnswer,
+          rawTranscript: finalRaw,
+          normalizedTranscript: finalNormalized,
+          score: data.questionScore,
+          feedback: data.questionFeedback,
+          evaluation: data.evaluation
+        }
+      }));
+
+      if (data.updatedQuestions) {
+        setQuestions(data.updatedQuestions);
       }
 
-    } catch (e) {
-      alert(`Error submitting answer: ${e.message}`);
-      setAvatarState('listening');
+      setInterimTranscript('');
+      setRawTranscriptText('');
+      setProctorLogs([]);
+
+      if (data.finished) {
+        setSessionResults(data.session);
+        setInterviewState('COMPLETED');
+        setLiveReaction('');
+        setIsStreamingReaction(false);
+        setView('results');
+      } else if (data.followUpInserted) {
+        // Adaptive follow-up question inserted
+        setInterviewState('FOLLOW_UP');
+        const nextIdx = currentIdx + 1;
+        setCurrentIdx(nextIdx);
+        setAnswerText('');
+        setLiveReaction('');
+        setIsStreamingReaction(false);
+        setStartTime(Date.now());
+        const nextQ = data.updatedQuestions?.[nextIdx]?.questionText || questions[nextIdx]?.questionText;
+        if (nextQ) speakQuestionText(nextQ);
+      } else {
+        const nextIdx = currentIdx + 1;
+        setCurrentIdx(nextIdx);
+        setAnswerText(savedAnswers[nextIdx]?.answer || '');
+        setLiveReaction('');
+        setIsStreamingReaction(false);
+        setStartTime(Date.now());
+        setInterviewState('READY_TO_ANSWER');
+        const nextQ = data.updatedQuestions?.[nextIdx]?.questionText || questions[nextIdx]?.questionText;
+        if (nextQ) speakQuestionText(nextQ);
+      }
+    } catch (err) {
+      setErrorMessage(err.message || 'Error submitting answer');
+      setInterviewState('READY_TO_ANSWER');
     } finally {
-      setLoading(false);
+      setSubmitting(false);
     }
   };
 
-  // Real-time proctor log callback
-  const handleProctorLog = (logItem) => {
-    // Add real timestamp to keep log date parsing solid
-    setProctorLogs(prev => [...prev, { ...logItem, timestamp: Date.now() }]);
+  const handlePrevQuestion = () => {
+    if (currentIdx === 0) return;
+    stopAllAudio();
+    const prevIdx = currentIdx - 1;
+    setCurrentIdx(prevIdx);
+    setAnswerText(savedAnswers[prevIdx]?.answer || '');
+    setLiveReaction('');
+    setIsStreamingReaction(false);
+    setInterviewState('READY_TO_ANSWER');
   };
 
-  return (
-    <div className="fade-in max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex flex-col gap-8">
-      {/* Page Header */}
-      <div className="border-b border-cream-300 pb-6">
-        <h1 className="text-3xl font-serif font-bold text-charcoal-900 flex items-center gap-2">
-          <ShieldAlert className="text-sage-500" />
-          GRID AI Mock Interview Arena
-        </h1>
-        <p className="text-sm text-charcoal-500">
-          Conduct realistic verbal technical reviews with active eye presence indicators and focus logs.
-        </p>
-      </div>
 
-      {/* Media Permission Warning Banner */}
-      {!permissionsGranted && !interviewStarted && (
-        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-          <div className="flex items-start gap-3">
-            <AlertCircle className="text-terracotta-500 shrink-0 mt-0.5" size={18} />
-            <div>
-              <h4 className="text-xs font-bold text-charcoal-900">Microphone & Camera Access Required</h4>
-              <p className="text-[11px] text-charcoal-500 mt-0.5 leading-relaxed">
-                We need device permission to run the audio speech recognizer and verify candidate integrity.
-              </p>
-              {permissionError && (
-                <p className="text-[10px] text-red-600 font-semibold mt-1">{permissionError}</p>
-              )}
-            </div>
-          </div>
-          <button
-            onClick={requestMediaPermissions}
-            disabled={requestingPerms}
-            className="bg-sage-500 hover:bg-sage-600 text-white text-xs font-semibold px-4 py-2 rounded-lg shadow-paper transition-all shrink-0 disabled:opacity-50"
-          >
-            {requestingPerms ? 'Granting...' : 'Grant Permissions'}
-          </button>
+  const handlePracticeAgain = () => {
+    stopAllAudio();
+    setView('wizard');
+    setWizardStep(0);
+    setSessionId(null);
+    setQuestions([]);
+    setSavedAnswers({});
+    setSessionResults(null);
+  };
+
+  const currentQuestion = questions[currentIdx];
+  const totalQuestions = questions.length;
+  const progressPercent = totalQuestions ? Math.round(((currentIdx + 1) / totalQuestions) * 100) : 0;
+
+  if (view === 'wizard') {
+    return (
+      <div className="max-w-3xl mx-auto py-8 px-4 font-sans fade-in">
+        <div className="flex items-center gap-2 mb-8">
+          {STEPS.map((label, idx) => {
+            const isDone = idx < wizardStep;
+            const isCurrent = idx === wizardStep;
+            return (
+              <React.Fragment key={label}>
+                <div className="flex items-center gap-2">
+                  <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold transition-all ${
+                    isDone
+                      ? 'bg-emerald-500 text-white shadow-sm'
+                      : isCurrent
+                        ? 'bg-sage-600 text-white ring-4 ring-sage-100 shadow-md'
+                        : 'bg-cream-300 text-charcoal-500'
+                  }`}>
+                    {isDone ? <Check className="w-4 h-4" /> : idx + 1}
+                  </div>
+                  <span className={`text-xs font-medium hidden sm:inline ${isCurrent ? 'text-charcoal-900 font-semibold' : 'text-charcoal-500'}`}>
+                    {label}
+                  </span>
+                </div>
+                {idx < STEPS.length - 1 && (
+                  <div className={`flex-1 h-0.5 rounded-full ${isDone ? 'bg-emerald-500' : 'bg-cream-300'}`} />
+                )}
+              </React.Fragment>
+            );
+          })}
         </div>
-      )}
 
-      {/* Split Layout: Control panel & camera monitor */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 items-start">
-        
-        {/* Left/Middle Column (Q&A Flow) */}
-        <div className="lg:col-span-2 flex flex-col gap-6">
-          {!interviewStarted && !evaluation && (
-            <div className="bg-cream-200 border border-cream-300 rounded-xl p-8 shadow-paper text-center flex flex-col gap-6 max-w-xl mx-auto w-full animate-scale-up">
-              <h3 className="text-xl font-serif font-bold text-charcoal-900">Setup Mock Session</h3>
-              <p className="text-xs text-charcoal-500 max-w-md mx-auto">
-                The session will generate 3 custom technical queries. Ensure your webcam is active and window tab focus is sustained.
-              </p>
+        <div className="bg-white rounded-2xl border border-cream-300 shadow-paper p-6 sm:p-8">
+          {errorMessage && (
+            <div className="mb-6 p-4 rounded-xl bg-red-50 border border-red-200 flex items-center gap-3 text-red-700 text-sm">
+              <AlertCircle className="w-5 h-5 flex-shrink-0" />
+              <span>{errorMessage}</span>
+            </div>
+          )}
 
-              {/* Speaker Echo Headphones Recommendation Tip */}
-              <div className="bg-amber-50 border border-amber-100 rounded-lg p-3 text-left max-w-xs mx-auto">
-                <p className="text-[10px] text-amber-800 leading-relaxed">
-                  💡 **Headphones Recommended:** Since this interview supports <strong>verbal barge-in</strong> (the AI halts speaking immediately when you speak), wearing headphones prevents speaker echo from falsely interrupting the interviewer.
-                </p>
+          {wizardStep === 0 && (
+            <div className="space-y-6">
+              <div className="flex items-center gap-3 pb-3 border-b border-cream-200">
+                <div className="p-2.5 bg-sage-50 rounded-xl text-sage-600">
+                  <Briefcase className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="text-xl font-serif font-bold text-charcoal-900">Job Details</h2>
+                  <p className="text-xs text-charcoal-500">Provide the role and requirements for AI to customize questions</p>
+                </div>
               </div>
 
-              <div className="flex flex-col gap-2 max-w-xs mx-auto text-left w-full">
-                <label className="text-[10px] font-bold text-charcoal-900 uppercase">Target Company Name</label>
+              <div>
+                <label className="block text-sm font-semibold text-charcoal-900 mb-1.5">
+                  Job Title <span className="text-terracotta-500">*</span>
+                </label>
                 <input
                   type="text"
-                  value={targetCompany}
-                  onChange={(e) => setTargetCompany(e.target.value)}
-                  placeholder="e.g. Google"
-                  className="px-3 py-2 bg-white border border-cream-300 rounded-lg text-xs focus:outline-none focus:border-sage-500"
+                  placeholder="e.g. Frontend Developer Intern, Full Stack Engineer"
+                  value={jobTitle}
+                  onChange={(e) => setJobTitle(e.target.value)}
+                  className="w-full px-4 py-3 rounded-xl border border-cream-300 focus:outline-none focus:ring-2 focus:ring-sage-500 text-charcoal-900 placeholder:text-charcoal-400 bg-cream-50"
                 />
               </div>
 
-              <button
-                onClick={handleStartInterview}
-                disabled={loading}
-                className="bg-sage-500 hover:bg-sage-600 text-white font-semibold py-3 rounded-lg shadow-paper transition-all text-xs max-w-xs mx-auto w-full flex items-center justify-center gap-1.5 disabled:opacity-50"
-              >
-                {loading ? <Loader2 size={12} className="animate-spin" /> : null}
-                <span>Start Interview Session</span>
-              </button>
-            </div>
-          )}
-
-          {/* Active Interview Panel */}
-          {interviewStarted && questions.length > 0 && (
-            <div className="bg-cream-200 border border-cream-300 rounded-xl p-6 shadow-paper flex flex-col gap-6">
-              
-              {/* Pulse Orb AI Avatar Visualizer */}
-              <div className="flex justify-center py-4 border-b border-cream-300">
-                <AIAvatar state={avatarState} />
-              </div>
-
-              {/* Turn Status Indicator */}
-              <div className="flex items-center gap-3 bg-white border border-cream-300 rounded-lg p-3 shadow-inner">
-                <div className={`w-3 h-3 rounded-full ${
-                  avatarState === 'ai_speaking' ? 'bg-sage-500 animate-pulse' :
-                  avatarState === 'listening' ? 'bg-terracotta-500 animate-pulse' :
-                  avatarState === 'processing' ? 'bg-amber-500 animate-ping' : 'bg-charcoal-400'
-                }`} />
-                <span className="text-[11px] font-bold uppercase tracking-wider text-charcoal-800">
-                  {avatarState === 'ai_speaking' && "AI Interviewer (Speaking Question aloud... Please listen)"}
-                  {avatarState === 'listening' && "Candidate Turn (Speak response or type below)"}
-                  {avatarState === 'processing' && "Interviewer Processing (Analyzing input...)"}
-                  {avatarState === 'idle' && "Session Paused"}
-                </span>
-              </div>
-
-              <div className="flex justify-between items-center text-xs text-charcoal-500 font-semibold uppercase tracking-wider">
-                <span>Interviewer Question {currentQIdx + 1} of {questions.length}</span>
-                <span className="text-sage-500 bg-white px-2.5 py-0.5 rounded-full border border-cream-300 font-bold">
-                  {targetCompany} Mock
-                </span>
-              </div>
-
-              {/* TTS Prompt Box */}
-              <div className="bg-white p-5 rounded-lg border border-cream-300 font-serif font-medium text-sm text-charcoal-900 leading-relaxed flex items-start gap-3">
-                <span className="text-xl shrink-0">💬</span>
-                <span>{questions[currentQIdx]}</span>
-              </div>
-
-              {/* Headphones active session reminder tip */}
-              <div className="bg-amber-50/50 border border-amber-100/50 rounded-lg p-2.5 text-[10px] text-amber-800 flex items-start gap-1.5 leading-relaxed">
-                <span>💡</span>
-                <span>Wearing headphones is recommended. The interview features voice-activated barge-in, which stops the AI immediately when you start speaking.</span>
-              </div>
-
-              {/* Verbal Transcript Box */}
-              <div className="flex flex-col gap-1.5">
-                <label className="text-[10px] font-bold text-charcoal-700 uppercase tracking-widest flex items-center justify-between">
-                  <span>Candidate Verbal Response</span>
-                  {avatarState === 'listening' && (
-                    <span className="text-terracotta-500 font-bold animate-pulse">● System Mic Active</span>
-                  )}
+              <div>
+                <label className="block text-sm font-semibold text-charcoal-900 mb-1.5">
+                  Company <span className="text-xs font-normal text-charcoal-500">(optional)</span>
                 </label>
+                <div className="relative">
+                  <input
+                    type="text"
+                    placeholder="e.g. Google, Microsoft, JTG, Amazon"
+                    value={company}
+                    onChange={(e) => setCompany(e.target.value)}
+                    onBlur={(e) => handleVerifyCompany(e.target.value)}
+                    className="w-full px-4 py-3 rounded-xl border border-cream-300 focus:outline-none focus:ring-2 focus:ring-sage-500 text-charcoal-900 placeholder:text-charcoal-400 bg-cream-50"
+                  />
+                  {verifyingCompany && (
+                    <div className="absolute right-3 top-3.5">
+                      <Loader2 className="w-4 h-4 animate-spin text-sage-500" />
+                    </div>
+                  )}
+                </div>
+                {companyVerification && (
+                  <div className={`mt-2 p-2.5 rounded-lg text-xs flex items-start gap-2 ${companyVerification.isVerified ? 'bg-emerald-50 border border-emerald-200 text-emerald-700' : 'bg-amber-50 border border-amber-200 text-amber-700'}`}>
+                    {companyVerification.isVerified
+                      ? <CheckCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                      : <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                    }
+                    <span>
+                      {companyVerification.isVerified ? '✓ Verified: ' : 'Unverified: '}
+                      {companyVerification.summary?.substring(0, 120)}
+                      {companyVerification.sources?.length > 0 && ` (${companyVerification.sources.length} source${companyVerification.sources.length > 1 ? 's' : ''})`}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <div className="flex justify-between items-center mb-1.5">
+                  <label className="text-sm font-semibold text-charcoal-900">
+                    Job Description <span className="text-terracotta-500">*</span>
+                  </label>
+                  <span className={`text-xs ${jobDescription.length < 50 ? 'text-terracotta-500' : 'text-sage-600'}`}>
+                    min. 50 chars — {jobDescription.length}/5000
+                  </span>
+                </div>
                 <textarea
-                  value={verbalTranscript}
-                  onChange={(e) => setVerbalTranscript(e.target.value)}
-                  placeholder="Your verbal answers will appear here in real-time, or you can type directly..."
-                  rows={4}
-                  disabled={avatarState === 'ai_speaking' || avatarState === 'processing'}
-                  className="w-full p-4 bg-white border border-cream-300 rounded-lg text-xs font-semibold focus:outline-none focus:border-sage-500 disabled:opacity-50"
+                  rows={5}
+                  placeholder="Paste the job description, key responsibilities, or technologies required (JavaScript, React, Node.js, DSA, System Design...)"
+                  value={jobDescription}
+                  onChange={(e) => setJobDescription(e.target.value)}
+                  className="w-full px-4 py-3 rounded-xl border border-cream-300 focus:outline-none focus:ring-2 focus:ring-sage-500 text-charcoal-900 placeholder:text-charcoal-400 bg-cream-50 resize-none"
                 />
               </div>
-
-              {/* Controls */}
-              <div className="flex justify-between items-center">
-                <button
-                  onClick={toggleRecording}
-                  disabled={avatarState === 'ai_speaking' || avatarState === 'processing'}
-                  className={`flex items-center gap-1.5 px-4 py-2.5 rounded-lg text-xs font-semibold transition-all ${
-                    isRecording 
-                      ? 'bg-terracotta-500 hover:bg-terracotta-600 text-white shadow-paper' 
-                      : 'bg-white border border-cream-300 hover:bg-cream-300 text-charcoal-900'
-                  } disabled:opacity-50`}
-                >
-                  <Mic size={14} />
-                  <span>{isRecording ? 'Stop Recording' : 'Push to Speak'}</span>
-                </button>
-
-                <button
-                  onClick={handleNextAnswerSubmit}
-                  disabled={loading || avatarState === 'ai_speaking'}
-                  className="bg-sage-500 hover:bg-sage-600 text-white font-semibold text-xs px-5 py-2.5 rounded-lg shadow-paper transition-all disabled:opacity-50 flex items-center gap-1.5"
-                >
-                  {loading ? <Loader2 size={12} className="animate-spin" /> : null}
-                  <span>{currentQIdx === questions.length - 1 ? 'Finish Interview' : 'Submit & Next'}</span>
-                </button>
-              </div>
-
             </div>
           )}
 
-          {/* Review Report Display */}
-          {evaluation && (
-            <div className="bg-cream-200 border border-cream-300 rounded-xl p-6 shadow-paper flex flex-col gap-6 animate-scale-up">
-              
-              <div className="flex items-center gap-3 border-b border-cream-300 pb-4">
-                <Award size={28} className="text-sage-500" />
+          {wizardStep === 1 && (
+            <div className="space-y-6">
+              <div className="flex items-center gap-3 pb-3 border-b border-cream-200">
+                <div className="p-2.5 bg-sage-50 rounded-xl text-sage-600">
+                  <Sliders className="w-5 h-5" />
+                </div>
                 <div>
-                  <h3 className="text-lg font-serif font-bold text-charcoal-900">AI Evaluation Report</h3>
-                  <p className="text-[10px] text-charcoal-500 uppercase tracking-wider font-semibold">
-                    {targetCompany} Mock Performance
-                  </p>
+                  <h2 className="text-xl font-serif font-bold text-charcoal-900">Preferences</h2>
+                  <p className="text-xs text-charcoal-500">Fine-tune interview depth, questions, and format</p>
                 </div>
               </div>
 
-              {/* Scoring summary */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                <div className="bg-white p-4 rounded-lg border border-cream-300 text-center">
-                  <div className="text-[10px] text-charcoal-700 font-bold uppercase">Overall Score</div>
-                  <div className="text-2xl font-serif font-bold text-sage-500 mt-1">{evaluation.score} / 100</div>
-                </div>
-
-                <div className="bg-white p-4 rounded-lg border border-cream-300 text-center sm:col-span-2">
-                  <div className="text-[10px] text-charcoal-700 font-bold uppercase text-left">Strengths</div>
-                  <ul className="text-[10px] text-sage-700 font-semibold text-left list-disc list-inside mt-1.5 space-y-0.5">
-                    {evaluation.strengths && evaluation.strengths.length > 0 ? (
-                      evaluation.strengths.map((str, idx) => <li key={idx}>{str}</li>)
-                    ) : (
-                      <li>Able to answer technical fundamentals.</li>
-                    )}
-                  </ul>
-                </div>
-              </div>
-
-              {/* Weaknesses */}
-              <div className="bg-white p-4 rounded-lg border border-cream-300">
-                <div className="text-[10px] text-charcoal-700 font-bold uppercase mb-1.5">Areas for Improvement</div>
-                <ul className="text-[10px] text-terracotta-700 font-semibold list-disc list-inside space-y-1">
-                  {evaluation.weaknesses && evaluation.weaknesses.length > 0 ? (
-                    evaluation.weaknesses.map((wk, idx) => <li key={idx}>{wk}</li>)
-                  ) : (
-                    <li>Explain the algorithmic space complexities and trace variables clearly.</li>
-                  )}
-                </ul>
-              </div>
-
-              {/* Detailed assessment */}
-              <div className="bg-white p-4 rounded-lg border border-cream-300">
-                <div className="text-[10px] text-charcoal-700 font-bold uppercase mb-2">Detailed Conceptual Assessment</div>
-                <div className="text-xs text-charcoal-900 leading-relaxed font-sans prose max-w-none">
-                  {evaluation.detailedAssessment || 'Review complete. Focus on resolving dynamic programming base-cases.'}
+              <div>
+                <label className="block text-sm font-semibold text-charcoal-900 mb-2">Experience Level</label>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                  {EXPERIENCE_LEVELS.map(({ value, label, sub }) => {
+                    const active = experienceLevel === value;
+                    return (
+                      <button
+                        key={value}
+                        type="button"
+                        onClick={() => setExperienceLevel(value)}
+                        className={`p-3.5 rounded-xl border text-left transition-all ${
+                          active
+                            ? 'border-sage-500 bg-sage-50 ring-2 ring-sage-500/20 text-sage-900 shadow-sm'
+                            : 'border-cream-300 bg-cream-50 hover:border-sage-300 text-charcoal-700'
+                        }`}
+                      >
+                        <p className="text-sm font-bold text-charcoal-900">{label}</p>
+                        <p className="text-xs text-charcoal-500 mt-0.5">{sub}</p>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
 
-              <button
-                onClick={() => setEvaluation(null)}
-                className="bg-sage-500 hover:bg-sage-600 text-white font-semibold text-xs py-3 rounded-lg shadow-paper transition-all"
-              >
-                Start New Session
-              </button>
+              <div>
+                <label className="block text-sm font-semibold text-charcoal-900 mb-2">
+                  Question Types <span className="text-xs font-normal text-charcoal-500">(select all that apply)</span>
+                </label>
+                <div className="flex flex-wrap gap-2">
+                  {QUESTION_TYPES.map(({ value, label }) => {
+                    const active = selectedTypes.includes(value);
+                    return (
+                      <button
+                        key={value}
+                        type="button"
+                        onClick={() => toggleType(value)}
+                        className={`px-4 py-2 rounded-full text-xs font-medium border transition-all flex items-center gap-1.5 ${
+                          active
+                            ? 'bg-sage-600 border-sage-600 text-white shadow-sm'
+                            : 'border-cream-300 bg-cream-50 text-charcoal-700 hover:border-sage-400'
+                        }`}
+                      >
+                        {active && <Check className="w-3.5 h-3.5" />}
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
 
+              <div>
+                <div className="flex justify-between items-center mb-1">
+                  <label className="text-sm font-semibold text-charcoal-900">
+                    Number of Questions: <span className="text-sage-600 font-bold ml-1">{numberOfQuestions}</span>
+                  </label>
+                </div>
+                <input
+                  type="range"
+                  min="3"
+                  max="15"
+                  step="1"
+                  value={numberOfQuestions}
+                  onChange={(e) => setNumberOfQuestions(parseInt(e.target.value))}
+                  className="w-full accent-sage-600 mt-2 cursor-pointer"
+                />
+                <div className="flex justify-between text-xs text-charcoal-400 mt-1">
+                  <span>3 questions (Quick)</span>
+                  <span>10 questions (Standard)</span>
+                  <span>15 questions (In-Depth)</span>
+                </div>
+              </div>
             </div>
           )}
+
+          {wizardStep === 2 && (
+            <div className="space-y-6">
+              <div className="flex items-center gap-3 pb-3 border-b border-cream-200">
+                <div className="p-2.5 bg-sage-50 rounded-xl text-sage-600">
+                  <FileText className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="text-xl font-serif font-bold text-charcoal-900">Resume <span className="text-xs font-normal text-charcoal-500">(session-specific)</span></h2>
+                  <p className="text-xs text-charcoal-500">Upload a resume for this session — it will NOT overwrite your profile</p>
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                {/* Option 1: Upload a resume for this session */}
+                <div
+                  className={`w-full p-4 rounded-xl border transition-all ${
+                    sessionResumeContext
+                      ? 'border-emerald-400 bg-emerald-50 ring-2 ring-emerald-400/20'
+                      : 'border-cream-300 bg-cream-50 hover:border-sage-300'
+                  }`}
+                >
+                  <div className="flex items-start justify-between mb-3">
+                    <div>
+                      <p className="text-sm font-bold text-charcoal-900">Upload for this session</p>
+                      <p className="text-xs text-charcoal-500">PDF or DOCX — tailors questions to this specific resume</p>
+                    </div>
+                    {sessionResumeContext && (
+                      <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded bg-emerald-200 text-emerald-800 flex items-center gap-1">
+                        <CheckCircle className="w-3 h-3" /> Parsed
+                      </span>
+                    )}
+                  </div>
+                  <input
+                    ref={resumeFileInputRef}
+                    type="file"
+                    accept=".pdf,.docx,.doc"
+                    className="hidden"
+                    onChange={(e) => {
+                      if (e.target.files?.[0]) {
+                        setUseResume(false);
+                        handleSessionResumeUpload(e.target.files[0]);
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => resumeFileInputRef.current?.click()}
+                    disabled={resumeUploading}
+                    className="px-4 py-2 rounded-lg bg-sage-600 text-white text-xs font-semibold hover:bg-sage-700 transition-colors flex items-center gap-2 disabled:opacity-60"
+                  >
+                    {resumeUploading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileText className="w-3.5 h-3.5" />}
+                    {resumeUploading ? 'Parsing resume...' : sessionResumeFile ? 'Replace file' : 'Choose file (PDF/DOCX)'}
+                  </button>
+                  {sessionResumeContext && (
+                    <div className="mt-2 text-xs text-emerald-700">
+                      ✓ <strong>{sessionResumeContext.originalName}</strong> — {sessionResumeContext.skills?.length || 0} skills detected
+                    </div>
+                  )}
+                  {resumeUploadStatus === 'error' && (
+                    <div className="mt-2 text-xs text-red-600 flex items-center gap-1">
+                      <AlertCircle className="w-3 h-3" /> Upload failed. Please try a valid PDF or DOCX.
+                    </div>
+                  )}
+                </div>
+
+                {/* Option 3: No resume */}
+                <button
+                  type="button"
+                  onClick={() => { setUseResume(false); setSessionResumeContext(null); setSessionResumeFile(null); setResumeUploadStatus(null); }}
+                  className={`w-full p-4 rounded-xl border text-left transition-all ${
+                    !useResume && !sessionResumeContext
+                      ? 'border-sage-500 bg-sage-50 ring-2 ring-sage-500/20'
+                      : 'border-cream-300 bg-cream-50 hover:border-sage-300'
+                  }`}
+                >
+                  <p className="text-sm font-bold text-charcoal-900">No resume — generic questions</p>
+                  <p className="text-xs text-charcoal-500 mt-0.5">AI generates questions based on job description only</p>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {wizardStep === 3 && (
+            <div className="space-y-6">
+              <div className="flex items-center gap-3 pb-3 border-b border-cream-200">
+                <div className="p-2.5 bg-terracotta-50 rounded-xl text-terracotta-600">
+                  <Sparkles className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="text-xl font-serif font-bold text-charcoal-900">Review & Generate</h2>
+                  <p className="text-xs text-charcoal-500">Verify your setup before AI generates the interview set</p>
+                </div>
+              </div>
+
+              <div className="divide-y divide-cream-200">
+                <div className="py-3 flex justify-between items-center text-sm">
+                  <span className="text-charcoal-500 font-medium">Job Title</span>
+                  <span className="font-bold text-charcoal-900">{jobTitle}</span>
+                </div>
+                <div className="py-3 flex justify-between items-center text-sm">
+                  <span className="text-charcoal-500 font-medium">Company</span>
+                  <span className="font-bold text-charcoal-900">{company || 'Not specified (General Tech)'}</span>
+                </div>
+                <div className="py-3 flex justify-between items-center text-sm">
+                  <span className="text-charcoal-500 font-medium">Experience Level</span>
+                  <span className="font-bold text-charcoal-900 capitalize">{experienceLevel} Level</span>
+                </div>
+                <div className="py-3 flex justify-between items-center text-sm">
+                  <span className="text-charcoal-500 font-medium">Question Types</span>
+                  <span className="font-bold text-charcoal-900">{selectedTypes.join(', ')}</span>
+                </div>
+                <div className="py-3 flex justify-between items-center text-sm">
+                  <span className="text-charcoal-500 font-medium">Number of Questions</span>
+                  <span className="font-bold text-sage-600">{numberOfQuestions}</span>
+                </div>
+                <div className="py-3 flex justify-between items-center text-sm">
+                  <span className="text-charcoal-500 font-medium">Resume</span>
+                  <span className="font-bold text-charcoal-900">
+                    {sessionResumeContext ? sessionResumeContext.originalName : 'None (Generic)'}
+                  </span>
+                </div>
+              </div>
+
+              <div className="p-4 rounded-xl bg-sage-50 border border-sage-200">
+                {isGenerating ? (
+                  <div className="flex items-center gap-3">
+                    <Loader2 className="w-5 h-5 text-sage-600 animate-spin flex-shrink-0" />
+                    <div>
+                      <p className="text-xs font-bold text-sage-900">Preparing Your Interview Environment</p>
+                      <p className="text-xs text-sage-700 mt-0.5 animate-pulse font-medium">{generationStage || 'Initializing AI session...'}</p>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-xs text-sage-800 leading-relaxed">
+                    AI will generate <strong>{numberOfQuestions} personalized questions</strong> grounded in {company || 'the tech industry'} and candidate requirements. This usually takes 3–8 seconds.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+
+          <div className="flex items-center justify-between mt-8 pt-4 border-t border-cream-200">
+            <button
+              type="button"
+              onClick={() => setWizardStep(s => s - 1)}
+              disabled={wizardStep === 0 || isGenerating}
+              className="px-5 py-2.5 rounded-xl text-sm font-semibold text-charcoal-700 bg-cream-200 hover:bg-cream-300 transition-colors disabled:opacity-40 flex items-center gap-1.5"
+            >
+              <ChevronLeft className="w-4 h-4" /> Back
+            </button>
+
+            {wizardStep < STEPS.length - 1 ? (
+              <button
+                type="button"
+                onClick={() => setWizardStep(s => s + 1)}
+                disabled={!canProceedWizard()}
+                className="px-6 py-2.5 rounded-xl text-sm font-semibold text-white bg-sage-600 hover:bg-sage-700 transition-colors shadow-sm disabled:opacity-50 flex items-center gap-1.5"
+              >
+                Next <ChevronRight className="w-4 h-4" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleStartInterview}
+                disabled={isGenerating}
+                className="px-7 py-2.5 rounded-xl text-sm font-bold text-white bg-sage-600 hover:bg-sage-700 transition-all shadow-md flex items-center gap-2 disabled:opacity-50"
+              >
+                {isGenerating ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Generating Questions...
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="w-4 h-4" />
+                    Generate & Start Interview
+                  </>
+                )}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (view === 'session') {
+    return (
+      <div className="max-w-7xl mx-auto py-6 px-4 sm:px-6 font-sans fade-in">
+        {/* Top Session Bar */}
+        <div className="bg-white rounded-2xl border border-cream-300 shadow-paper p-5 mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <h2 className="text-xl font-serif font-bold text-charcoal-900">{jobTitle || 'Mock Interview Session'}</h2>
+            <p className="text-xs text-charcoal-500 capitalize mt-0.5">
+              {company || 'General Tech'} • {experienceLevel} level • {totalQuestions} questions
+            </p>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1.5 text-xs bg-cream-100 px-3 py-1.5 rounded-lg border border-cream-300 font-mono text-charcoal-800">
+              <Clock className="w-3.5 h-3.5 text-sage-600" />
+              <span>{formatTime(elapsed)}</span>
+            </div>
+            <span className="text-xs font-bold text-sage-600 bg-sage-50 px-3 py-1.5 rounded-lg border border-sage-200">
+              {currentIdx + 1} / {totalQuestions || 1}
+            </span>
+          </div>
         </div>
 
-        {/* Right Column: Camera Proctor Monitor */}
-        <div className="lg:col-span-1">
-          <div className="bg-cream-200 border border-cream-300 rounded-xl p-5 shadow-paper flex flex-col gap-4">
-            <h3 className="font-serif font-bold text-charcoal-900 flex items-center justify-between">
-              <span>Proctoring Feed</span>
-              {interviewStarted && (
-                <span className="w-2.5 h-2.5 bg-red-500 rounded-full animate-ping"></span>
-              )}
-            </h3>
-            
-            {/* Camera Proctoring Component - render conditionally on interview start */}
-            {interviewStarted ? (
-              <CameraProctor 
-                onLogAdded={handleProctorLog} 
+        {/* 2-Column Responsive Layout */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          {/* Main Interview Area (Left 8 Cols) */}
+          <div className="lg:col-span-8 space-y-6">
+            <div className="w-full h-2 bg-cream-200 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-sage-600 transition-all duration-300 rounded-full"
+                style={{ width: `${progressPercent}%` }}
               />
-            ) : (
-              <div className="aspect-video bg-charcoal-900/10 border border-dashed border-cream-300 rounded-lg flex items-center justify-center text-xs text-charcoal-500 italic">
-                Camera feed offline until session starts
-              </div>
-            )}
+            </div>
 
-            <div className="border-t border-cream-300 pt-4 flex flex-col gap-2">
-              <h4 className="text-[10px] font-bold text-charcoal-900 uppercase">Integrity Log</h4>
-              <div className="h-28 bg-white border border-cream-300 rounded-lg p-2.5 overflow-y-auto flex flex-col gap-1.5">
-                {proctorLogs.map((log, idx) => (
-                  <div key={idx} className="text-[9px] text-terracotta-500 font-semibold">
-                    [{log.event}] at {new Date(log.timestamp).toLocaleTimeString()}: {log.details}
+            <div className="bg-white rounded-2xl border border-cream-300 shadow-paper p-6 sm:p-8 space-y-6">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-bold px-2.5 py-1 rounded-md bg-sage-100 text-sage-800 border border-sage-200">
+                  Q{currentIdx + 1}
+                </span>
+                {interviewState === 'FOLLOW_UP' ? (
+                  <span className="text-xs font-bold px-2.5 py-1 rounded-md bg-indigo-100 text-indigo-800 border border-indigo-200 uppercase tracking-wider flex items-center gap-1">
+                    <Sparkles className="w-3 h-3" /> Adaptive Follow-up
+                  </span>
+                ) : (
+                  <span className={`text-xs font-bold px-2.5 py-1 rounded-md uppercase tracking-wider ${
+                    currentQuestion?.difficulty === 'easy'
+                      ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                      : currentQuestion?.difficulty === 'hard'
+                        ? 'bg-terracotta-100 text-terracotta-800 border border-terracotta-200'
+                        : 'bg-amber-100 text-amber-800 border border-amber-200'
+                  }`}>
+                    {currentQuestion?.difficulty || 'medium'}
+                  </span>
+                )}
+                <span className="text-xs font-medium px-2.5 py-1 rounded-md bg-cream-100 text-charcoal-700 border border-cream-200 capitalize">
+                  {currentQuestion?.category || 'technical'}
+                </span>
+                {savedAnswers[currentIdx] && (
+                  <span className="text-xs font-medium px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 flex items-center gap-1">
+                    <CheckCircle className="w-3.5 h-3.5" /> Answered
+                  </span>
+                )}
+              </div>
+
+              <div className="flex items-start justify-between gap-4">
+                <p className="text-lg font-serif font-bold text-charcoal-900 leading-relaxed">
+                  {currentQuestion?.questionText || 'Loading question...'}
+                </p>
+                <button
+                  type="button"
+                  onClick={toggleSpeakCurrentQuestion}
+                  className={`p-2.5 rounded-full transition-all flex-shrink-0 ${
+                    isSpeaking
+                      ? 'bg-sage-600 text-white animate-pulse shadow-sm'
+                      : 'bg-cream-100 text-charcoal-600 hover:bg-cream-200 border border-cream-300'
+                  }`}
+                  title={isSpeaking ? 'Stop speaking' : 'Read question aloud (ElevenLabs AI)'}
+                >
+                  {isSpeaking ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
+                </button>
+              </div>
+
+              <div>
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                  <label className="text-sm font-semibold text-charcoal-900">
+                    {interviewState === 'RECORDING' ? (
+                      <span className="text-red-600 flex items-center gap-1.5 font-bold">
+                        <span className="w-2 h-2 rounded-full bg-red-500 animate-ping" />
+                        Recording Speech (Pauses are OK)...
+                      </span>
+                    ) : interviewState === 'REVIEWING' ? (
+                      <span className="text-sage-700 font-bold">Your Answer (Voice Captured — Edit or Add More)</span>
+                    ) : (
+                      'Your Answer'
+                    )}
+                  </label>
+
+                  <div className="flex items-center gap-2">
+                    {interviewState === 'RECORDING' ? (
+                      <button
+                        type="button"
+                        onClick={stopVoiceAnswer}
+                        className="flex items-center gap-1.5 text-xs px-3.5 py-1.5 rounded-lg font-bold bg-red-600 text-white animate-pulse shadow-md hover:bg-red-700 transition-all"
+                      >
+                        <MicOff className="w-3.5 h-3.5" />
+                        <span>Stop & Save Voice</span>
+                      </button>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => startVoiceAnswer('append')}
+                          disabled={submitting}
+                          className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-semibold bg-sage-50 text-sage-800 border border-sage-300 hover:bg-sage-100 transition-all disabled:opacity-50"
+                          title="Speak to add or continue answering without losing existing text"
+                        >
+                          <Mic className="w-3.5 h-3.5 text-sage-600" />
+                          <span>{answerText.trim() ? 'Add More (Voice)' : 'Voice Input'}</span>
+                        </button>
+                        {answerText.trim() && (
+                          <button
+                            type="button"
+                            onClick={() => startVoiceAnswer('clear')}
+                            disabled={submitting}
+                            className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg font-medium text-charcoal-500 hover:text-red-600 hover:bg-red-50 border border-transparent hover:border-red-200 transition-all disabled:opacity-50"
+                            title="Clear answer text and start fresh recording"
+                          >
+                            <RotateCcw className="w-3 h-3" />
+                            <span>Clear & Re-record</span>
+                          </button>
+                        )}
+                      </>
+                    )}
                   </div>
-                ))}
-                {proctorLogs.length === 0 && (
-                  <div className="text-[9px] text-charcoal-400 italic text-center py-6">
-                    {interviewStarted ? 'Monitoring webcam & window focus...' : 'Integrity logs will appear here during active session.'}
+                </div>
+
+                {/* Live Interim Speech Preview during Recording */}
+                {interviewState === 'RECORDING' && (
+                  <div className="mb-2.5 p-3 bg-red-50/90 border border-red-200 rounded-xl text-xs text-red-950 flex items-start gap-2.5 shadow-sm">
+                    <div className="w-2.5 h-2.5 rounded-full bg-red-500 animate-ping mt-1 flex-shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <p className="font-bold text-red-700 mb-0.5">Microphone Active</p>
+                      <p className="italic text-charcoal-800 break-words">
+                        {interimTranscript || rawTranscriptText || 'Start speaking your answer...'}
+                      </p>
+                    </div>
                   </div>
+                )}
+
+                {/* Review Banner */}
+                {interviewState === 'REVIEWING' && (
+                  <div className="mb-2.5 p-2.5 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-900 flex items-center gap-2">
+                    <CheckCircle className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+                    <span>Speech captured. You can freely edit text or click "Add More (Voice)" to append additional thoughts.</span>
+                  </div>
+                )}
+
+                <textarea
+                  rows={6}
+                  value={answerText}
+                  onChange={(e) => {
+                    setAnswerText(e.target.value);
+                    if (interviewState === 'REVIEWING' || interviewState === 'RECORDING') {
+                      setInterviewState('READY_TO_ANSWER');
+                    }
+                  }}
+                  placeholder={
+                    interviewState === 'RECORDING'
+                      ? 'Listening for your speech...'
+                      : "Type your answer here, or click 'Voice Input' to speak naturally. Highlight concepts, trade-offs, and technical rationale..."
+                  }
+                  className={`w-full p-4 rounded-xl border transition-all text-charcoal-900 placeholder:text-charcoal-400 bg-cream-50 focus:outline-none focus:ring-2 focus:ring-sage-500 text-sm resize-none ${
+                    interviewState === 'RECORDING' ? 'ring-2 ring-red-400 border-red-300' : 'border-cream-300'
+                  }`}
+                />
+                <div className="flex justify-between items-center text-xs text-charcoal-400 mt-1.5">
+                  <span>{answerText.length} characters</span>
+                  {savedAnswers[currentIdx]?.score !== undefined && (
+                    <span className="text-sage-700 font-semibold">
+                      Last Score: {savedAnswers[currentIdx].score}/10
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {currentQuestion?.expectedKeywords?.length > 0 && (
+                <div className="p-3.5 rounded-xl bg-sage-50/70 border border-sage-200">
+                  <p className="text-xs text-sage-900">
+                    💡 <strong>Topic hints:</strong> {currentQuestion.expectedKeywords.join(' • ')}
+                  </p>
+                </div>
+              )}
+
+              {/* Streamed Live Interviewer Reaction */}
+              {(liveReaction || isStreamingReaction) && (
+                <div className="mt-4 p-4 bg-charcoal-900 rounded-xl border border-charcoal-800 font-mono text-xs text-emerald-300 shadow-inner fade-in">
+                  <div className="flex items-center gap-2 mb-2 pb-2 border-b border-charcoal-800">
+                    <div className="w-2 h-2 bg-emerald-400 rounded-full animate-pulse" />
+                    <span className="text-[10px] font-bold text-emerald-400 uppercase tracking-widest">
+                      AI Interviewer Live Reaction
+                    </span>
+                  </div>
+                  <p className="leading-relaxed font-sans text-xs text-emerald-200">{liveReaction}</p>
+                  {isStreamingReaction && <span className="inline-block w-1.5 h-3 ml-1 bg-emerald-400 animate-pulse" />}
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between pt-2">
+              <button
+                type="button"
+                onClick={handlePrevQuestion}
+                disabled={currentIdx === 0 || submitting || interviewState === 'RECORDING'}
+                className="px-5 py-2.5 rounded-xl text-sm font-semibold text-charcoal-700 bg-white border border-cream-300 hover:bg-cream-100 transition-colors disabled:opacity-40 flex items-center gap-1.5"
+              >
+                <ChevronLeft className="w-4 h-4" /> Previous
+              </button>
+
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => handleSubmitAnswer(true)}
+                  disabled={submitting || interviewState === 'RECORDING'}
+                  className="px-4 py-2.5 rounded-xl text-sm font-medium text-charcoal-500 hover:text-charcoal-800 transition-colors flex items-center gap-1 disabled:opacity-40"
+                >
+                  <SkipForward className="w-4 h-4" /> Skip
+                </button>
+
+                {currentIdx < totalQuestions - 1 ? (
+                  <button
+                    type="button"
+                    onClick={() => handleSubmitAnswer(false)}
+                    disabled={submitting || !answerText.trim() || interviewState === 'RECORDING'}
+                    className="px-6 py-2.5 rounded-xl text-sm font-bold text-white bg-sage-600 hover:bg-sage-700 transition-all shadow-sm disabled:opacity-40 flex items-center gap-2"
+                  >
+                    {submitting ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" /> Evaluating...
+                      </>
+                    ) : (
+                      <>
+                        <Send className="w-4 h-4" /> Save & Next
+                      </>
+                    )}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => handleSubmitAnswer(false)}
+                    disabled={submitting || !answerText.trim() || interviewState === 'RECORDING'}
+                    className="px-6 py-2.5 rounded-xl text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 transition-all shadow-sm disabled:opacity-40 flex items-center gap-2"
+                  >
+                    {submitting ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" /> Finalizing...
+                      </>
+                    ) : (
+                      <>
+                        <CheckCircle className="w-4 h-4" /> Finish & Get Results
+                      </>
+                    )}
+                  </button>
                 )}
               </div>
             </div>
           </div>
+
+          {/* Right Side Dock: Video Proctor & Audio Monitor (4 Cols) */}
+          <div className="lg:col-span-4 space-y-4 lg:sticky lg:top-6">
+            <CameraProctor
+              onLogAdded={(log) => setProctorLogs((prev) => [...prev, log])}
+              isListening={isListening}
+              interviewState={interviewState}
+            />
+
+            <div className="bg-white p-4 rounded-xl border border-cream-300 shadow-paper space-y-2.5">
+              <p className="text-xs font-bold text-charcoal-800 flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-sage-600" />
+                <span>AI Interview Grounding</span>
+              </p>
+              <div className="text-xs text-charcoal-600 space-y-1">
+                <p>• <strong>Target Role:</strong> {jobTitle}</p>
+                <p>• <strong>Company Context:</strong> {company || 'General Tech'}</p>
+                <p>• <strong>Evaluator:</strong> RAG + Groq AI Assessment</p>
+              </div>
+            </div>
+
+            <div className="bg-cream-50/80 p-3.5 rounded-xl border border-cream-200 text-xs text-charcoal-600 space-y-1">
+              <p className="font-semibold text-charcoal-800">💡 Interview Tips</p>
+              <p>• Speak clearly into your mic or type anytime.</p>
+              <p>• Use "Add More (Voice)" to append additional points without losing previous text.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (view === 'results') {
+    const report = sessionResults?.feedback || {};
+    const score = typeof report.score === 'number' ? report.score : 0;
+    const scoreColor = score >= 80 ? 'text-emerald-600 border-emerald-500' : score >= 60 ? 'text-blue-600 border-blue-500' : score >= 40 ? 'text-amber-600 border-amber-500' : score >= 20 ? 'text-orange-600 border-orange-500' : 'text-terracotta-600 border-terracotta-500';
+    const scoreLabel = score >= 80 ? 'Strong Performance' : score >= 60 ? 'Decent Attempt' : score >= 40 ? 'Needs Improvement' : score >= 20 ? 'Weak — Study Required' : 'Not Ready Yet';
+    const scoreSub = score >= 80 ? 'You demonstrated solid technical depth.' : score >= 60 ? 'Good foundation — sharpen the details.' : score >= 40 ? 'Core concepts need more practice.' : score >= 20 ? 'Significant gaps in technical knowledge.' : 'Focus on fundamentals before your next interview.';
+
+    return (
+      <div className="max-w-4xl mx-auto py-8 px-4 font-sans space-y-8 fade-in">
+        <div className="bg-white rounded-2xl border border-cream-300 shadow-paper p-8 text-center">
+          <div className={`inline-flex items-center justify-center w-28 h-28 rounded-full border-4 mb-4 bg-cream-50 ${scoreColor}`}>
+            <span className="text-3xl font-serif font-bold">{score}%</span>
+          </div>
+          <h2 className="text-2xl font-serif font-bold text-charcoal-900 mb-1">{scoreLabel}</h2>
+          <p className="text-sm text-charcoal-500 mb-1">{scoreSub}</p>
+          <p className="text-xs text-charcoal-400 mb-4">
+            {jobTitle || 'Mock Interview'} • {questions.length} questions completed
+          </p>
+
+          {report.detailedAssessment && (
+            <p className="text-sm text-charcoal-700 bg-cream-50 border border-cream-200 rounded-xl p-5 max-w-2xl mx-auto leading-relaxed text-left">
+              {report.detailedAssessment}
+            </p>
+          )}
+
+          <div className="flex items-center justify-center gap-4 mt-6">
+            <button
+              onClick={handlePracticeAgain}
+              className="px-6 py-2.5 rounded-xl text-sm font-bold text-white bg-sage-600 hover:bg-sage-700 transition-all shadow-sm flex items-center gap-2"
+            >
+              <RotateCcw className="w-4 h-4" /> Practice Again
+            </button>
+            <a
+              href="/dashboard"
+              className="px-5 py-2.5 rounded-xl text-sm font-semibold text-charcoal-700 bg-cream-100 hover:bg-cream-200 transition-colors border border-cream-300"
+            >
+              Back to Dashboard
+            </a>
+          </div>
         </div>
 
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="bg-white rounded-2xl border border-cream-300 shadow-paper p-6">
+            <h3 className="font-serif font-bold text-charcoal-900 mb-4 flex items-center gap-2 text-base">
+              <ThumbsUp className="w-5 h-5 text-emerald-600" /> Strengths
+            </h3>
+            {report.strengths?.length ? (
+              <ul className="space-y-2.5">
+                {report.strengths.map((s, i) => (
+                  <li key={i} className="flex items-start gap-2.5 text-xs text-charcoal-700 leading-relaxed">
+                    <CheckCircle className="w-4 h-4 text-emerald-600 mt-0.5 flex-shrink-0" />
+                    <span>{s}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-xs text-charcoal-400">Consistent attempt across technical questions.</p>
+            )}
+          </div>
+
+          <div className="bg-white rounded-2xl border border-cream-300 shadow-paper p-6">
+            <h3 className="font-serif font-bold text-charcoal-900 mb-4 flex items-center gap-2 text-base">
+              <Target className="w-5 h-5 text-amber-600" /> Areas to Improve
+            </h3>
+            {report.weaknesses?.length ? (
+              <ul className="space-y-2.5">
+                {report.weaknesses.map((w, i) => (
+                  <li key={i} className="flex items-start gap-2.5 text-xs text-charcoal-700 leading-relaxed">
+                    <Lightbulb className="w-4 h-4 text-amber-600 mt-0.5 flex-shrink-0" />
+                    <span>{w}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-xs text-charcoal-400">Keep practicing depth on algorithmic complexity.</p>
+            )}
+          </div>
+        </div>
+
+        {report.improvementTips?.length > 0 && (
+          <div className="bg-white rounded-2xl border border-cream-300 shadow-paper p-6">
+            <h3 className="font-serif font-bold text-charcoal-900 mb-4 flex items-center gap-2 text-base">
+              <BookOpen className="w-5 h-5 text-sage-600" /> Actionable Next Steps
+            </h3>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {report.improvementTips.map((tip, i) => (
+                <div key={i} className="p-3.5 rounded-xl bg-cream-50 border border-cream-200 flex items-start gap-3">
+                  <span className="w-5 h-5 rounded-full bg-sage-600 text-white flex items-center justify-center text-[10px] font-bold flex-shrink-0 mt-0.5">
+                    {i + 1}
+                  </span>
+                  <p className="text-xs text-charcoal-800 leading-relaxed">{tip}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="bg-white rounded-2xl border border-cream-300 shadow-paper p-6">
+          <h3 className="font-serif font-bold text-charcoal-900 mb-5 flex items-center gap-2 text-base">
+            <Trophy className="w-5 h-5 text-terracotta-600" /> Question-by-Question Review
+          </h3>
+
+          <div className="space-y-3">
+            {questions.map((q, i) => {
+              const ans = savedAnswers[i];
+              const isExpanded = expandedAnswerIdx === i;
+              const qScore = ans?.score ?? 5;
+              const scoreBadgeClr = qScore >= 7 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : qScore >= 4 ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-red-50 text-red-700 border-red-200';
+
+              return (
+                <div key={i} className="border border-cream-300 rounded-xl overflow-hidden">
+                  <button
+                    type="button"
+                    onClick={() => setExpandedAnswerIdx(isExpanded ? null : i)}
+                    className="w-full p-4 text-left flex items-center justify-between gap-4 bg-cream-50 hover:bg-cream-100 transition-colors"
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="text-xs font-bold text-sage-700">Q{i + 1}</span>
+                      <p className="text-xs font-medium text-charcoal-900 truncate max-w-md sm:max-w-lg">
+                        {q.questionText}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className={`text-xs font-bold px-2.5 py-1 rounded-md border ${scoreBadgeClr}`}>
+                        {qScore}/10
+                      </span>
+                      <span className="text-xs text-charcoal-400 font-bold">{isExpanded ? '▲' : '▼'}</span>
+                    </div>
+                  </button>
+
+                  {isExpanded && (
+                    <div className="p-4 bg-white border-t border-cream-200 space-y-3 text-xs">
+                      <div>
+                        <span className="font-semibold text-charcoal-500 uppercase tracking-wider text-[10px]">Your Answer:</span>
+                        <p className="mt-1 text-charcoal-800 bg-cream-50 p-3 rounded-lg border border-cream-200">
+                          {ans?.answer || 'No answer recorded'}
+                        </p>
+                      </div>
+                      {ans?.feedback && (
+                        <div>
+                          <span className="font-semibold text-sage-700 uppercase tracking-wider text-[10px]">AI Evaluation:</span>
+                          <p className="mt-1 text-sage-900 bg-sage-50/60 p-3 rounded-lg border border-sage-200">
+                            {ans.feedback}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
       </div>
-    </div>
-  );
+    );
+  }
+
+  return null;
 }

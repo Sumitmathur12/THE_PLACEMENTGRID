@@ -169,10 +169,62 @@ const SpacedRepetitionSchema = new mongoose.Schema({
 // InterviewSession Schema
 const InterviewSessionSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  company: { type: String, required: true },
+  status: { type: String, enum: ['in_progress', 'completed', 'abandoned'], default: 'in_progress' },
+  currentQuestionIndex: { type: Number, default: 0 },
+  company: { type: String, default: 'General Tech' },
+  jobTitle: { type: String, default: 'Software Engineer' },
+  jobDescription: { type: String, default: '' },
+  experienceLevel: { type: String, default: 'mid' },
+  jobDetails: {
+    title: String,
+    company: String,
+    description: String,
+    structuredJD: mongoose.Schema.Types.Mixed
+  },
+  companyVerification: {
+    isVerified: { type: Boolean, default: false },
+    summary: { type: String, default: '' },
+    sources: [{
+      sourceType: { type: String, enum: ['official', 'community', 'rag'], default: 'community' },
+      sourceUrl: String,
+      title: String,
+      retrievedAt: { type: Date, default: Date.now }
+    }]
+  },
+  resumeContext: {
+    originalName: String,
+    fileType: String,
+    skills: [String],
+    projects: [mongoose.Schema.Types.Mixed],
+    experience: [mongoose.Schema.Types.Mixed],
+    education: [mongoose.Schema.Types.Mixed],
+    parsedText: String
+  },
+  questions: [{
+    questionText: String,
+    category: { type: String, default: 'technical' },
+    difficulty: { type: String, enum: ['easy', 'medium', 'hard'], default: 'medium' },
+    expectedKeywords: [String],
+    concept: { type: String, default: '' },
+    source: [{ type: String }],
+    sourceReferences: [{ type: String }],
+    isFollowUp: { type: Boolean, default: false },
+    parentQuestionId: String
+  }],
+  // Cached at session start (local KnowledgeBase + live web search context
+  // used to generate the original questions). Reused when generating
+  // adaptive follow-up questions mid-session.
+  groundingContext: { type: String, default: '' },
+  // Hard cap on how many adaptive follow-ups can be inserted into one session
+  followUpCount: { type: Number, default: 0 },
   transcript: [{
     speaker: { type: String, enum: ['interviewer', 'candidate'] },
-    text: String
+    text: String,
+    rawTranscript: String,
+    normalizedTranscript: String,
+    score: Number,       // 0-10 scale
+    feedback: String,
+    evaluation: mongoose.Schema.Types.Mixed
   }],
   proctoringIntegrityScore: { type: Number, default: 100 },
   proctoringLogs: [{
@@ -184,6 +236,7 @@ const InterviewSessionSchema = new mongoose.Schema({
     strengths: [String],
     weaknesses: [String],
     detailedAssessment: String,
+    improvementTips: [String], // concrete, actionable next steps
     score: Number // 1-100 scale
   },
   date: { type: Date, default: Date.now }
@@ -216,8 +269,22 @@ const KnowledgeBaseSchema = new mongoose.Schema({
   }
 }, { timestamps: true });
 
-// Create indexes for Vector Search or Text Search
+// Create indexes for high-concurrency lookups and query scaling
 KnowledgeBaseSchema.index({ content: 'text', title: 'text' });
+QuestionSchema.index({ category: 1, difficulty: 1 });
+QuestionSchema.index({ category: 1, origin: 1 });
+QuestionSchema.index({ companies: 1 });
+InterviewSessionSchema.index({ userId: 1, createdAt: -1 });
+InterviewSessionSchema.index({ userId: 1, status: 1 });
+AttemptSchema.index({ userId: 1, date: -1 });
+AttemptSchema.index({ userId: 1, category: 1 });
+SpacedRepetitionSchema.index({ userId: 1, questionId: 1 }, { unique: true });
+SpacedRepetitionSchema.index({ userId: 1, nextReviewDate: 1 });
+RoadmapSchema.index({ domain: 1 });
+RoadmapSchema.index({ userId: 1 });
+RoadmapSchema.index({ companyId: 1 });
+InterviewExperienceSchema.index({ company: 1, role: 1 });
+InterviewExperienceSchema.index({ date: -1 });
 
 export const User = mongoose.model('User', UserSchema);
 export const Company = mongoose.model('Company', CompanySchema);

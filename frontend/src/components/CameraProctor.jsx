@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Camera, ShieldAlert, CheckCircle, VideoOff } from 'lucide-react';
 
-export default function CameraProctor({ onLogAdded }) {
+export default function CameraProctor({ onLogAdded, isListening = false, interviewState = 'READY_TO_ANSWER' }) {
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const [stream, setStream] = useState(null);
@@ -126,14 +126,31 @@ export default function CameraProctor({ onLogAdded }) {
       <div className="flex items-center justify-between border-b border-cream-200 pb-2">
         <span className="font-serif font-semibold text-sm flex items-center gap-1.5 text-sage-700">
           <Camera size={16} />
-          Proctor Monitor
+          Proctor & Audio
         </span>
-        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-          integrityScore > 80 ? 'bg-sage-100 text-sage-700' :
-          integrityScore > 50 ? 'bg-amber-100 text-amber-700' : 'bg-red-100 text-red-700'
-        }`}>
-          Integrity: {integrityScore}%
-        </span>
+        <div className="flex items-center gap-2">
+          {isListening ? (
+            <span className="text-[10px] bg-red-100 text-red-700 font-bold px-2 py-0.5 rounded-full flex items-center gap-1 animate-pulse border border-red-200">
+              <span className="w-1.5 h-1.5 bg-red-500 rounded-full animate-ping" />
+              Mic Recording
+            </span>
+          ) : interviewState === 'QUESTION_READING' ? (
+            <span className="text-[10px] bg-indigo-100 text-indigo-700 font-bold px-2 py-0.5 rounded-full flex items-center gap-1 border border-indigo-200">
+              <span className="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-pulse" />
+              AI Speaking
+            </span>
+          ) : (
+            <span className="text-[10px] bg-cream-200 text-charcoal-600 font-medium px-2 py-0.5 rounded-full">
+              Mic Ready
+            </span>
+          )}
+          <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+            integrityScore > 80 ? 'bg-sage-100 text-sage-700' :
+            integrityScore > 50 ? 'bg-amber-100 text-amber-700' : 'bg-red-100 text-red-700'
+          }`}>
+            Integrity: {integrityScore}%
+          </span>
+        </div>
       </div>
 
       {/* Webcam Viewfinder */}
@@ -186,11 +203,6 @@ export default function CameraProctor({ onLogAdded }) {
         >
           Simulate Multi-Face
         </button>
-      </div>
-
-      <div className="text-[10px] text-charcoal-500 flex gap-1.5 items-start">
-        <ShieldAlert size={12} className="shrink-0 mt-0.5 text-terracotta-500" />
-        <span>Grounded locally in-browser. All logs remain client-side and delete on session exit.</span>
       </div>
     </div>
   );

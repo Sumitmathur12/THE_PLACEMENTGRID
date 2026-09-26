@@ -89,17 +89,11 @@ export const requireAuth = async (req, res, next) => {
         completedRoadmapTopics: []
       });
     } else {
-      // NOTE: Streak is intentionally NOT incremented here. This middleware
-      // runs on every single authenticated request (page loads, polling,
-      // etc.) — incrementing a "genuine preparation" streak here would mean
-      // simply having the app open counts as activity, which directly
-      // contradicts the anti-gaming rule that a login/visit alone must never
-      // extend the streak. Streak updates happen exclusively through
-      // `activityService.recalculateStreakAndScore`, triggered only by real
-      // actions (practice submissions, roadmap task completion, finishing a
-      // mock interview, a resume analysis, or a validated heartbeat ping).
-      user.lastActiveDate = new Date();
-      await user.save();
+      const now = new Date();
+      if (!user.lastActiveDate || (now.getTime() - new Date(user.lastActiveDate).getTime()) > 5 * 60 * 1000) {
+        user.lastActiveDate = now;
+        User.updateOne({ _id: user._id }, { $set: { lastActiveDate: now } }).catch(() => {});
+      }
     }
 
     req.user = user;

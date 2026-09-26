@@ -356,11 +356,34 @@ export const ragRetrieve = async (query, topK = 5) => {
   }
 };
 
+// High-Performance In-Memory Response Cache for LLM calls (TTL: 15 mins, max 500 items)
+const llmResponseCache = new Map();
+const LLM_CACHE_TTL_MS = 15 * 60 * 1000;
+const MAX_CACHE_ENTRIES = 500;
+
 // Core LLM generation wrapper with Groq (primary), Gemini, and OpenRouter (free tier fallbacks)
-export const generateLLMResponse = async (systemPrompt, userPrompt) => {
+export const generateLLMResponse = async (systemPrompt, userPrompt, options = {}) => {
   const groqKey = getGroqKey();
   const geminiKey = getGeminiKey();
   const openrouterKey = process.env.OPENROUTER_API_KEY || '';
+  const tokenBudget = options.maxTokens || 500;
+  const temp = options.temperature !== undefined ? options.temperature : 0.2;
+  const useCache = options.noCache !== true;
+
+  // Compress whitespace and redundant empty lines from prompts to minimize token overhead
+  const cleanSystemPrompt = (systemPrompt || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n\n').trim();
+  const cleanUserPrompt = (userPrompt || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n\n').trim();
+
+  // Fast In-Memory Cache Lookup
+  const cacheKey = `${cleanSystemPrompt}:::${cleanUserPrompt}:::${tokenBudget}:::${temp}`;
+  if (useCache && llmResponseCache.has(cacheKey)) {
+    const cachedEntry = llmResponseCache.get(cacheKey);
+    if (Date.now() - cachedEntry.timestamp < LLM_CACHE_TTL_MS) {
+      console.log('[LLM Cache HIT] Returned cached response in <1ms.');
+      return cachedEntry.data;
+    }
+    llmResponseCache.delete(cacheKey);
+  }
 
   const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -372,14 +395,33 @@ export const generateLLMResponse = async (systemPrompt, userPrompt) => {
         const result = await fn();
         if (result && result.trim()) {
           console.log(`[LLM Chain SUCCESS] Generated response using: ${providerName}`);
+          
+          // Cache successful response
+          if (useCache) {
+            if (llmResponseCache.size >= MAX_CACHE_ENTRIES) {
+              const firstKey = llmResponseCache.keys().next().value;
+              llmResponseCache.delete(firstKey);
+            }
+            llmResponseCache.set(cacheKey, { data: result, timestamp: Date.now() });
+          }
           return result;
         }
         console.warn(`[LLM Chain WARNING] ${providerName} returned empty response on attempt ${i}.`);
       } catch (err) {
         console.warn(`[LLM Chain WARNING] ${providerName} attempt ${i} failed: ${err.message}`);
+        // If 429 rate limit hit, do not wait 36s — immediately break to next provider in chain!
+        if (err.message && (err.message.includes('429') || err.message.includes('rate_limit'))) {
+          console.warn(`[LLM Chain] 429 on ${providerName} — instantly routing to next provider...`);
+          break;
+        }
+        // If 503 unavailable, short wait
+        if (err.message && (err.message.includes('503') || err.message.includes('UNAVAILABLE'))) {
+          await delay(800);
+          continue;
+        }
       }
       if (i < maxRetries) {
-        await delay(1000); // 1s cooldown between retries
+        await delay(500);
       }
     }
     return null;
@@ -391,14 +433,15 @@ export const generateLLMResponse = async (systemPrompt, userPrompt) => {
       const groq = new Groq({ apiKey: groqKey });
       const completion = await groq.chat.completions.create({
         messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
+          { role: 'system', content: cleanSystemPrompt },
+          { role: 'user', content: cleanUserPrompt }
         ],
-        model: 'llama-3.1-8b-instant',
-        temperature: 0.2,
+        model: 'qwen/qwen3.8-27b',
+        temperature: temp,
+        max_tokens: tokenBudget,
       });
       return completion.choices[0]?.message?.content || '';
-    });
+    }, 2);
     if (response) return response;
   }
 
@@ -407,14 +450,14 @@ export const generateLLMResponse = async (systemPrompt, userPrompt) => {
     const response = await attemptRequest('Gemini', async () => {
       const ai = new GoogleGenAI({ apiKey: geminiKey });
       const response = await ai.models.generateContent({
-        model: 'gemini-1.5-flash',
-        contents: `${systemPrompt}\n\nUser request:\n${userPrompt}`,
+        model: 'gemini-3.6-flash',
+        contents: `${cleanSystemPrompt}\n\nUser request:\n${cleanUserPrompt}`,
         config: {
-          temperature: 0.2,
+          temperature: temp,
         }
       });
       return response.text || '';
-    });
+    }, 2);
     if (response) return response;
   }
 
@@ -430,8 +473,8 @@ export const generateLLMResponse = async (systemPrompt, userPrompt) => {
         body: JSON.stringify({
           model: 'meta-llama/llama-3.1-8b-instruct:free',
           messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt }
+            { role: 'system', content: cleanSystemPrompt },
+            { role: 'user', content: cleanUserPrompt }
           ],
           temperature: 0.2
         })
@@ -447,7 +490,7 @@ export const generateLLMResponse = async (systemPrompt, userPrompt) => {
 
   // 4. Fallback only if all providers fail or are unconfigured
   console.log('RAG / AI: Operating in offline mode. Generating structured fallback mockup.');
-  return getOfflineFallbackContent(userPrompt);
+  return getOfflineFallbackContent(cleanUserPrompt);
 };
 
 // Strict prompting wrapper
@@ -554,59 +597,780 @@ Remember: Do not invent any URLs. If no URLs exist in the context, list the topi
 };
 
 // Interview Transcript Feedback
-export const getInterviewFeedback = async (transcript, companyName, proctorLogs) => {
-  const cleanCompanyName = companyName.replace(/_\d+$/, '');
-  const context = await ragRetrieve(`${cleanCompanyName} technical HR interview questions answers metrics`, 3);
+export const getInterviewFeedback = async (transcript, companyName, proctorLogs, perQuestionEvaluations = []) => {
+  const cleanCompanyName = (companyName || 'General Tech').replace(/_\d+$/, '');
   
   const formattedTranscript = transcript.map(t => `${t.speaker.toUpperCase()}: ${t.text}`).join('\n');
   const formattedLogs = proctorLogs.map(l => `[${l.event}] at ${new Date(l.timestamp).toLocaleTimeString()}: ${l.details}`).join('\n');
 
-  // Redesigned evaluation prompt to avoid strict "insufficient context" blocker on evaluation tasks
-  const systemPrompt = `You are a professional SDE interviewer evaluating a candidate transcript for ${cleanCompanyName}.
-Current Year: 2026 — distinguish clearly between older interview patterns (pre-2024) mentioned in sources and recent/current ones; note if a source seems outdated.
+  // Compute exact honest mathematical score from per-question evaluations
+  const totalPoints = perQuestionEvaluations.reduce((sum, q) => sum + (typeof q.score === 'number' ? q.score : 0), 0);
+  const maxPossible = Math.max(1, perQuestionEvaluations.length * 10);
+  const mathematicalPct = Math.round((totalPoints / maxPossible) * 100);
 
-Assess their communication clarity and technical accuracy (correctness of systems, algorithms, memory, frameworks).
-Formulate your evaluation in JSON format with these exact keys:
-- score: (a number from 1 to 100 representing their performance score)
-- strengths: (array of strings, outlining strong points of their answers; must NOT be empty)
-- weaknesses: (array of strings, outlining areas of improvement; must NOT be empty)
-- detailedAssessment: (a short markdown summary outlining conceptual corrections)
+  const perQuestionSummary = perQuestionEvaluations.length > 0
+    ? perQuestionEvaluations.map((e, i) => `Q${i + 1} Score: ${e.score}/10 — ${e.feedback}`).join('\n')
+    : 'Not available — evaluate holistically from the transcript below.';
 
-STRICT FORMATTING DIRECTIVE:
-- Respond with pure valid JSON only. Do not add markdown code fences, backticks, or any commentary before or after the JSON.
-- Output MUST be a valid JSON object matching the keys above.`;
+  const systemPrompt = `You are a senior hiring manager and staff engineering interviewer at ${cleanCompanyName}.
+Current Year: 2026.
 
-  const userPrompt = `Evaluate this transcript:
+Your task is to provide an HONEST, OBJECTIVE, and REALISTIC evaluation of the candidate's interview performance based on the transcript and per-question scores below.
+
+CRITICAL SCORING MANDATE:
+1. STRICT HONESTY: Do NOT inflate scores. If the candidate skipped questions, gave incorrect answers, lacked technical depth, or scored poorly on individual questions, their overall score MUST strictly reflect this reality (e.g. 0-40%).
+2. The mathematical benchmark from their answers is ${mathematicalPct}%. Your overall score must closely match their genuine performance across all questions.
+3. DETAILED ASSESSMENT: Provide a clear, readable 2-4 sentence summary diagnosing their exact technical and communication strengths and gaps. Do NOT include JSON formatting in detailedAssessment text.
+
+Respond ONLY with a valid JSON object matching this schema:
+{
+  "score": <integer from 0 to 100 matching their genuine performance>,
+  "strengths": ["<Specific concept, structure, or behavior done well>"],
+  "weaknesses": ["<Specific concept missed, incorrect explanation, or skipped topic>"],
+  "detailedAssessment": "<Clean paragraph assessing their readiness and performance>",
+  "improvementTips": ["<Concrete actionable step 1>", "<Concrete actionable step 2>", "<Concrete actionable step 3>"]
+}`;
+
+  const userPrompt = `Per-question evaluations:
+${perQuestionSummary}
+
+Candidate's Mathematical Score Benchmark: ${mathematicalPct}%
+
+Full Transcript:
 ${formattedTranscript}
 
-Observed proctoring event logs:
-${formattedLogs}`;
+Observed Proctoring Events:
+${formattedLogs || 'No proctoring violations recorded.'}`;
 
-  const responseText = await generateLLMResponse(systemPrompt, userPrompt);
+  const responseText = await generateLLMResponse(systemPrompt, userPrompt, { maxTokens: 1000, temperature: 0.1 });
   
   try {
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
-      // Verify arrays are populated
-      if (!parsed.strengths || !Array.isArray(parsed.strengths) || parsed.strengths.length === 0) {
-        parsed.strengths = ['Demonstrated fundamental knowledge of target platform architecture'];
+      const honestScore = typeof parsed.score === 'number' ? Math.max(0, Math.min(100, Math.round(parsed.score))) : mathematicalPct;
+      
+      // Clean detailedAssessment if it was wrapped with quotes or code blocks
+      let cleanAssessment = (parsed.detailedAssessment || '').replace(/^```[a-z]*\s*/i, '').replace(/```$/, '').trim();
+      if (cleanAssessment.startsWith('{') && cleanAssessment.includes('detailedAssessment')) {
+        try {
+          const inner = JSON.parse(cleanAssessment);
+          if (inner.detailedAssessment) cleanAssessment = inner.detailedAssessment;
+        } catch (_) {}
       }
-      if (!parsed.weaknesses || !Array.isArray(parsed.weaknesses) || parsed.weaknesses.length === 0) {
-        parsed.weaknesses = ['Improve explanation depth for algorithms and system complexities'];
-      }
-      return parsed;
+
+      return {
+        score: honestScore,
+        strengths: Array.isArray(parsed.strengths) && parsed.strengths.length > 0 ? parsed.strengths : (honestScore > 50 ? ['Demonstrated basic problem-solving awareness'] : ['Attempted the interview process']),
+        weaknesses: Array.isArray(parsed.weaknesses) && parsed.weaknesses.length > 0 ? parsed.weaknesses : ['Need to deepen conceptual understanding and avoid skipping technical questions'],
+        improvementTips: Array.isArray(parsed.improvementTips) && parsed.improvementTips.length > 0 ? parsed.improvementTips : ['Review the foundational data structures and core architecture patterns', 'Practice vocalizing solutions step-by-step before answering'],
+        detailedAssessment: cleanAssessment || `Candidate completed ${perQuestionEvaluations.length} questions with an overall score of ${honestScore}%.`
+      };
     }
   } catch (e) {
-    console.warn('Failed to parse interview feedback JSON, returning raw text feedback');
+    console.warn('Failed to parse interview feedback JSON, constructing structured honest feedback:', e.message);
+  }
+
+  // Guaranteed honest fallback calculation
+  let fallbackAssessment = responseText.replace(/\{[\s\S]*\}/, '').trim();
+  if (!fallbackAssessment || fallbackAssessment.length < 20) {
+    fallbackAssessment = mathematicalPct >= 70
+      ? `Strong performance across technical questions with solid conceptual clarity.`
+      : mathematicalPct >= 40
+        ? `Moderate performance. Demonstrated basic understanding but struggled with architectural depth and optimization.`
+        : `Performance was below the expected threshold for this role. Multiple questions were skipped or lacked core technical correctness.`;
   }
 
   return {
-    score: 75,
-    strengths: ['Demonstrated standard logical processing', 'Engaged in conversational turn-taking'],
-    weaknesses: ['Elaborate on low-level memory usage parameters'],
-    detailedAssessment: responseText
+    score: mathematicalPct,
+    strengths: mathematicalPct >= 50
+      ? ['Demonstrated fundamental knowledge of target role concepts', 'Attempted technical problem-solving']
+      : ['Engaged with the interview format and attempted questions'],
+    weaknesses: mathematicalPct >= 50
+      ? ['Elaborate on edge cases, system bottlenecks, and memory trade-offs']
+      : ['Critical gaps in core technical concepts and system architecture', 'Skipped questions without explanation'],
+    improvementTips: [
+      'Study core algorithms, system design patterns, and framework fundamentals',
+      'Practice answering technical questions using the structured STAR/problem-breakdown method',
+      'Re-attempt this mock interview after reviewing your question-by-question breakdown'
+    ],
+    detailedAssessment: fallbackAssessment
   };
+};
+
+/**
+ * Generate a structured set of interview questions (technical + behavioral),
+ * each tagged with difficulty and expected keywords, grounded in the
+ * existing company research context (local RAG + live web search) and candidate background.
+ *
+ * @param {Object} params
+ * @param {string} params.companyName
+ * @param {string} params.localContext - retrieved local KnowledgeBase text
+ * @param {string} params.webContext - retrieved live web search text
+ * @param {string} params.candidateProfile - candidate resume/skills/background
+/**
+ * Parse raw job description into structured technical requirements and concepts.
+ */
+export const parseJobDescription = async (jobDescription) => {
+  if (!jobDescription || !jobDescription.trim()) {
+    return {
+      title: '',
+      requiredSkills: [],
+      preferredSkills: [],
+      technologies: [],
+      responsibilities: [],
+      experienceLevel: 'mid',
+      domain: 'General Software Engineering',
+      concepts: ['Core Data Structures & Complexity', 'System Architecture & Modularity', 'Asynchronous Operations & Concurrency', 'Data Persistence & Query Efficiency', 'Resilience, Error Handling & Testing']
+    };
+  }
+
+  const systemPrompt = `You are a technical recruitment architect. Analyze the job description and extract structured technical requirements.
+Current Year: 2026.
+Return pure valid JSON only — no markdown fences, no commentary.
+JSON format:
+{
+  "title": "<job title>",
+  "requiredSkills": ["<skill1>", "<skill2>"],
+  "preferredSkills": ["<skill1>", "<skill2>"],
+  "technologies": ["<tech1>", "<tech2>"],
+  "responsibilities": ["<responsibility1>"],
+  "experienceLevel": "entry" | "mid" | "senior",
+  "domain": "<e.g. Frontend Web, Distributed Systems, Cloud Infrastructure>",
+  "concepts": [
+    "<Concept 1: e.g. State Management & Lifecycle>",
+    "<Concept 2: e.g. Rendering Performance & Virtual DOM>",
+    "<Concept 3: e.g. Asynchronous Data Fetching & Cache Invalidation>",
+    "<Concept 4: e.g. API Integration & Security>",
+    "<Concept 5: e.g. Production Debugging & Error Boundaries>"
+  ]
+}`;
+
+  const userPrompt = `Job Description:\n${jobDescription.substring(0, 4000)}`;
+  const responseText = await generateLLMResponse(systemPrompt, userPrompt);
+
+  try {
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      return {
+        title: parsed.title || '',
+        requiredSkills: Array.isArray(parsed.requiredSkills) ? parsed.requiredSkills : [],
+        preferredSkills: Array.isArray(parsed.preferredSkills) ? parsed.preferredSkills : [],
+        technologies: Array.isArray(parsed.technologies) ? parsed.technologies : [],
+        responsibilities: Array.isArray(parsed.responsibilities) ? parsed.responsibilities : [],
+        experienceLevel: ['entry', 'mid', 'senior'].includes(parsed.experienceLevel) ? parsed.experienceLevel : 'mid',
+        domain: parsed.domain || 'Software Engineering',
+        concepts: Array.isArray(parsed.concepts) && parsed.concepts.length > 0
+          ? parsed.concepts
+          : ['Core Architecture', 'State & Data Flow', 'Async Concurrency', 'Database & Indexing', 'Error Handling']
+      };
+    }
+  } catch (e) {
+    console.warn('parseJobDescription failed to parse JSON, using fallback:', e.message);
+  }
+
+  return {
+    title: '',
+    requiredSkills: [],
+    preferredSkills: [],
+    technologies: [],
+    responsibilities: [],
+    experienceLevel: 'mid',
+    domain: 'Software Engineering',
+    concepts: ['Core Architecture', 'State & Data Flow', 'Async Concurrency', 'Database & Indexing', 'Error Handling']
+  };
+};
+
+/**
+ * Verify company context using multi-source verification (RAG + Web Search).
+ * Explicitly separates official sources from public community reports.
+ */
+export const verifyCompanyContext = async (companyName) => {
+  const cleanCompany = (companyName || '').replace(/_\d+$/, '').trim();
+  if (!cleanCompany || cleanCompany.toLowerCase() === 'general tech') {
+    return {
+      isVerified: true,
+      summary: 'General technology role covering industry-standard engineering practices and computer science fundamentals.',
+      sources: [{
+        sourceType: 'official',
+        sourceUrl: 'https://developer.mozilla.org',
+        title: 'Industry Standard Engineering Competencies',
+        retrievedAt: new Date()
+      }]
+    };
+  }
+
+  let ragChunks = [];
+  try {
+    ragChunks = await ragRetrieve(`${cleanCompany} technical interview questions hiring process engineering culture`, 3);
+  } catch (_) {}
+
+  let webData = { text: '', results: [] };
+  try {
+    webData = await runWebSearchRaw(`${cleanCompany} software engineer interview questions tech stack`);
+  } catch (_) {}
+
+  const sources = [];
+  if (Array.isArray(ragChunks)) {
+    ragChunks.forEach(chunk => {
+      sources.push({
+        sourceType: 'rag',
+        sourceUrl: (chunk.metadata && chunk.metadata.sourceLinks && chunk.metadata.sourceLinks[0]?.url) || 'https://theplacementgrid.internal/knowledge-base',
+        title: chunk.title || `${cleanCompany} KnowledgeBase Context`,
+        retrievedAt: new Date()
+      });
+    });
+  }
+
+  if (Array.isArray(webData.results)) {
+    webData.results.forEach(res => {
+      const url = (res.url || res.link || '').toLowerCase();
+      const cleanLower = cleanCompany.toLowerCase().replace(/\s+/g, '');
+      const isOfficial = url.includes(cleanLower) || url.includes('.com/careers') || url.includes('.com/jobs') || url.includes('about.') || url.includes('github.com/' + cleanLower);
+      sources.push({
+        sourceType: isOfficial ? 'official' : 'community',
+        sourceUrl: res.url || res.link || 'https://websearch.theplacementgrid.internal',
+        title: res.title || `${cleanCompany} Interview Context`,
+        retrievedAt: new Date()
+      });
+    });
+  }
+
+  const combinedSummary = [
+    ragChunks.map(c => c.content).join(' '),
+    webData.text || ''
+  ].filter(Boolean).join(' ');
+
+  const summary = combinedSummary
+    ? combinedSummary.slice(0, 320).replace(/\s+/g, ' ') + '...'
+    : `Verified hiring and technical assessment patterns for ${cleanCompany}.`;
+
+  return {
+    isVerified: sources.length > 0 || !!combinedSummary,
+    summary,
+    sources: sources.slice(0, 6)
+  };
+};
+
+/**
+ * Filter out candidate questions that have high semantic similarity with questions previously asked to the user.
+ * Supports array of question objects/strings OR a single question string.
+ */
+export const checkSemanticDuplicates = (candidateQuestions, pastQuestions = [], threshold = 0.70) => {
+  const tokenize = (str) => {
+    return new Set(
+      (str || '')
+        .toLowerCase()
+        .replace(/[^\w\s]/g, ' ')
+        .split(/\s+/)
+        .filter(w => w.length > 3 && !['what', 'when', 'where', 'which', 'explain', 'describe', 'difference', 'between', 'would', 'could', 'should'].includes(w))
+    );
+  };
+
+  const getJaccard = (tokens1, tokens2) => {
+    if (tokens1.size === 0 || tokens2.size === 0) return 0;
+    let intersection = 0;
+    for (const t of tokens1) {
+      if (tokens2.has(t)) intersection++;
+    }
+    const union = new Set([...tokens1, ...tokens2]).size;
+    return union === 0 ? 0 : intersection / union;
+  };
+
+  const pastTokenSets = (pastQuestions || []).map(q => tokenize(typeof q === 'string' ? q : q?.questionText || ''));
+
+  // Single question string/object mode
+  if (typeof candidateQuestions === 'string' || (candidateQuestions && !Array.isArray(candidateQuestions))) {
+    const text = typeof candidateQuestions === 'string' ? candidateQuestions : candidateQuestions?.questionText || '';
+    const candTokens = tokenize(text);
+    for (const pTokens of pastTokenSets) {
+      const sim = getJaccard(candTokens, pTokens);
+      if (sim >= threshold) {
+        return { isDuplicate: true, similarity: sim };
+      }
+    }
+    return { isDuplicate: false, similarity: 0 };
+  }
+
+  // Array mode
+  if (!pastQuestions || pastQuestions.length === 0 || !candidateQuestions || candidateQuestions.length === 0) {
+    return candidateQuestions || [];
+  }
+
+  return candidateQuestions.filter(q => {
+    const text = typeof q === 'string' ? q : q.questionText || '';
+    const candidateTokens = tokenize(text);
+    for (const pTokens of pastTokenSets) {
+      const sim = getJaccard(candidateTokens, pTokens);
+      if (sim >= threshold) {
+        console.log(`[Deduplication] Dropping candidate question due to high similarity (${sim.toFixed(2)}): "${text.substring(0, 40)}..."`);
+        return false;
+      }
+    }
+    return true;
+  });
+};
+
+
+/**
+ * Generate a structured set of interview questions grounded in JD coverage plan,
+ * verified company context, candidate resume, and verified against past questions to prevent repetition.
+ */
+export const generateStructuredInterviewQuestions = async ({
+  companyName = 'Tech Company',
+  jobTitle = 'Software Engineer',
+  experienceLevel = 'mid',
+  questionTypes = ['technical', 'behavioral'],
+  localContext = '',
+  webContext = '',
+  candidateProfile = '',
+  jobDescription = '',
+  structuredJD = null,
+  sources = [],
+  pastQuestions = [],
+  count = 5
+}) => {
+  const cleanCompanyName = (companyName || '').replace(/_\d+$/, '') || 'Tech Company';
+  const targetTypes = Array.isArray(questionTypes) && questionTypes.length > 0 ? questionTypes : ['technical', 'behavioral'];
+
+  // Parse JD if structuredJD not already provided
+  const jdAnalysis = structuredJD || await parseJobDescription(jobDescription);
+  const coverageConcepts = (jdAnalysis.concepts && jdAnalysis.concepts.length > 0)
+    ? jdAnalysis.concepts
+    : ['Core Architecture & Modularity', 'State Management & Async Operations', 'Performance Optimization & Latency', 'Database Design & Querying', 'Production Reliability & Incident Handling'];
+
+  const pastSummary = pastQuestions && pastQuestions.length > 0
+    ? pastQuestions.slice(0, 15).map((q, i) => `${i + 1}. ${q}`).join('\n')
+    : 'None';
+
+  const systemPrompt = `You are a senior technical interviewer hiring for "${jobTitle}" at ${cleanCompanyName}.
+Target Experience Level: ${experienceLevel.toUpperCase()}
+Requested Categories: ${targetTypes.join(', ')}
+Current Year: 2026.
+
+MANDATORY RULES:
+1. QUESTION FRESHNESS & NO DUPLICATES:
+Do NOT repeat or closely rephrase any of the previously asked questions listed below.
+Rotate question angles: use different technical scenarios, failure modes, design trade-offs, or concrete edge cases.
+2. STRICT GROUNDING:
+Every question must be explicitly grounded in:
+- The Job Description requirements / technologies
+- The Candidate's Resume / background (probe projects or claimed skills)
+- The verified Company context
+3. JD COVERAGE PLAN:
+Distribute the ${count} questions across distinct technical concepts:
+${coverageConcepts.map((c, i) => `Concept ${i + 1}: ${c}`).join('\n')}
+
+Respond with pure valid JSON only — no markdown fences, no commentary.`;
+
+  const userPrompt = `Job Title: ${jobTitle}
+Company: ${cleanCompanyName}
+Experience Level: ${experienceLevel}
+Job Description Analysis:
+- Required Skills: ${(jdAnalysis.requiredSkills || []).join(', ') || 'General software engineering'}
+- Technologies: ${(jdAnalysis.technologies || []).join(', ') || 'Modern stack'}
+- Domain: ${jdAnalysis.domain || 'Software Engineering'}
+
+Candidate Profile/Resume:
+${candidateProfile ? candidateProfile.substring(0, 2000) : 'Standard candidate background.'}
+
+Company Context:
+${localContext ? localContext.substring(0, 1000) : ''}
+${webContext ? webContext.substring(0, 1000) : ''}
+
+PREVIOUSLY ASKED QUESTIONS TO THIS USER (DO NOT REPEAT):
+${pastSummary}
+
+Generate ${count + 4} completely distinct, non-repetitive candidate questions (generating extra for deduplication margin). Do NOT repeat any questions listed above.
+For each question, provide:
+- questionText: (string, clear, scenario-rich interview question)
+- category: one of [${targetTypes.join(', ')}]
+- difficulty: "easy" | "medium" | "hard"
+- expectedKeywords: (array of 3-5 technical keywords/concepts)
+- concept: (string, the specific technical concept addressed from the coverage plan)
+- source: (array of strings, e.g. ["jobDescription", "resume"] or ["companyContext", "jobDescription"])
+- sourceReferences: (array of strings, specific excerpt/skill from JD or resume that triggered this question)
+
+Return JSON format:
+{
+  "questions": [
+    {
+      "questionText": "...",
+      "category": "technical",
+      "difficulty": "medium",
+      "expectedKeywords": ["...", "..."],
+      "concept": "...",
+      "source": ["jobDescription"],
+      "sourceReferences": ["..."]
+    }
+  ]
+}`;
+
+  const responseText = await generateLLMResponse(systemPrompt, userPrompt);
+
+  let parsedQuestions = [];
+  try {
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(jsonMatch[0]);
+      } catch (err) {
+        const objectMatches = jsonMatch[0].match(/\{[^{}]*"questionText"[^{}]*\}/g) || [];
+        const recovered = [];
+        for (const objStr of objectMatches) {
+          try { recovered.push(JSON.parse(objStr)); } catch (_) {}
+        }
+        if (recovered.length > 0) parsed = { questions: recovered };
+      }
+
+      if (parsed && Array.isArray(parsed.questions)) {
+        parsedQuestions = parsed.questions
+          .filter(q => q.questionText)
+          .map(q => ({
+            questionText: q.questionText.trim(),
+            category: q.category || 'technical',
+            difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
+            expectedKeywords: Array.isArray(q.expectedKeywords) ? q.expectedKeywords.slice(0, 5) : [],
+            concept: q.concept || 'Technical Proficiency',
+            source: Array.isArray(q.source) && q.source.length > 0 ? q.source : ['jobDescription'],
+            sourceReferences: Array.isArray(q.sourceReferences) ? q.sourceReferences : ['Job Description Specifications']
+          }));
+      }
+    }
+  } catch (e) {
+    console.warn('Failed to parse interview questions JSON:', e.message);
+  }
+
+  // Deduplicate against past questions
+  let freshQuestions = checkSemanticDuplicates(parsedQuestions, pastQuestions, 0.70);
+
+  // Fallback generator that produces guaranteed, high-quality, customized questions even in total AI outage
+  const generateRoleBasedFallbacks = (neededCount, existingList) => {
+    const isFrontend = /frontend|ui|react|web|javascript|css/i.test(`${jobTitle} ${jobDescription}`);
+    const isBackend = /backend|api|server|node|python|java|golang|sql|database/i.test(`${jobTitle} ${jobDescription}`);
+    
+    const bank = [
+      {
+        questionText: isFrontend
+          ? `In modern React applications, how do you handle state re-renders and memory optimization when dealing with high-frequency updates or large datasets? Explain tools or patterns you use.`
+          : isBackend
+            ? `How do you design database indexing and connection pooling for a high-throughput API endpoint at ${cleanCompanyName}? Walk through how you prevent connection starvation and slow query bottlenecks.`
+            : `In the context of ${jobTitle} at ${cleanCompanyName}, how would you architect state synchronization and caching across distributed clients? Walk me through cache invalidation strategies you have applied.`,
+        category: 'technical',
+        difficulty: 'medium',
+        expectedKeywords: isFrontend ? ['useMemo', 'useCallback', 'virtualization', 're-renders', 'memoization'] : ['indexing', 'connection pool', 'query optimization', 'throughput'],
+        concept: isFrontend ? 'UI State & Render Optimization' : 'Database Performance & API Design',
+        source: ['jobDescription'],
+        sourceReferences: ['Core Technical Competency']
+      },
+      {
+        questionText: isFrontend
+          ? `Explain the JavaScript event loop, microtask queue vs macrotask queue, and how asynchronous events like Promises, requestAnimationFrame, and setTimeout interact in the browser.`
+          : `Explain how you handle distributed transactions or eventual consistency across multiple microservices. When would you choose Saga pattern vs 2-phase commit?`,
+        category: 'technical',
+        difficulty: 'medium',
+        expectedKeywords: isFrontend ? ['event loop', 'microtasks', 'macrotasks', 'call stack', 'Promise'] : ['eventual consistency', 'Saga pattern', 'idempotency', 'distributed transactions'],
+        concept: isFrontend ? 'Runtime Concurrency & Event Scheduling' : 'Distributed System Architecture',
+        source: ['jobDescription'],
+        sourceReferences: ['Core Engineering Standards']
+      },
+      {
+        questionText: `Can you discuss a challenging technical bottleneck, bug, or latency issue you encountered in a recent project? What was your systematic debugging process and how did you verify the fix?`,
+        category: 'technical',
+        difficulty: 'medium',
+        expectedKeywords: ['profiling', 'root cause analysis', 'systematic debugging', 'monitoring', 'verification'],
+        concept: 'Debugging & Root Cause Analysis',
+        source: ['resume'],
+        sourceReferences: ['Candidate Project Experience']
+      },
+      {
+        questionText: `How does your code handle partial network failures, timeouts, and transient service degradations? Walk through your implementation of retries, exponential backoff, and circuit breakers.`,
+        category: 'technical',
+        difficulty: 'hard',
+        expectedKeywords: ['circuit breaker', 'exponential backoff', 'idempotency', 'graceful degradation', 'fault tolerance'],
+        concept: 'System Resilience & Fault Tolerance',
+        source: ['jobDescription'],
+        sourceReferences: ['Production Reliability Standards']
+      },
+      {
+        questionText: `Tell me about a time you had to deliver a critical milestone under ambiguous requirements or tight deadlines at work or in a team project. How did you prioritize scope and communicate trade-offs?`,
+        category: 'behavioral',
+        difficulty: 'easy',
+        expectedKeywords: ['stakeholder management', 'scope negotiation', 'clear communication', 'delivery ownership'],
+        concept: 'Engineering Ownership & Collaboration',
+        source: ['companyContext'],
+        sourceReferences: ['Team Collaboration Values']
+      },
+      {
+        questionText: `How do you approach security best practices in ${jobTitle} applications? Specifically, how do you prevent common vulnerabilities like injection, XSS/CSRF, and insecure data handling in production?`,
+        category: 'technical',
+        difficulty: 'medium',
+        expectedKeywords: ['sanitization', 'authentication', 'JWT', 'encryption', 'security headers', 'CORS'],
+        concept: 'Application Security & Data Protection',
+        source: ['jobDescription'],
+        sourceReferences: ['Security & Quality Standards']
+      },
+      {
+        questionText: `Describe a situation where you had a technical disagreement with a peer regarding an architectural choice or code review feedback. How did you evaluate both perspectives and reach consensus?`,
+        category: 'behavioral',
+        difficulty: 'easy',
+        expectedKeywords: ['constructive feedback', 'data-driven decision', 'code review', 'empathy', 'consensus'],
+        concept: 'Peer Review & Constructive Conflict Resolution',
+        source: ['companyContext'],
+        sourceReferences: ['Engineering Culture Fit']
+      },
+      {
+        questionText: `How do you structure automated tests (unit, integration, and end-to-end) to maintain high release velocity while avoiding fragile test suites? Give concrete examples from your experience.`,
+        category: 'technical',
+        difficulty: 'medium',
+        expectedKeywords: ['unit testing', 'integration testing', 'mocking', 'CI/CD pipeline', 'regression prevention'],
+        concept: 'Testing Strategy & Code Quality',
+        source: ['jobDescription'],
+        sourceReferences: ['Testing Standards']
+      }
+    ];
+
+    const results = [...existingList];
+    const existingTexts = new Set(results.map(q => q.questionText));
+
+    for (const item of bank) {
+      if (!existingTexts.has(item.questionText)) {
+        results.push(item);
+        existingTexts.add(item.questionText);
+      }
+      if (results.length >= neededCount) break;
+    }
+
+    // If still short of neededCount (e.g. user requested 10+ questions), synthesize variation questions
+    let index = 1;
+    while (results.length < neededCount) {
+      const genericQ = {
+        questionText: `Question ${results.length + 1}: As a ${experienceLevel} ${jobTitle} at ${cleanCompanyName}, describe your methodology for optimizing system scalability, code maintainability, and operational observability in production.`,
+        category: (targetTypes.includes('behavioral') && results.length % 3 === 0) ? 'behavioral' : 'technical',
+        difficulty: results.length % 2 === 0 ? 'hard' : 'medium',
+        expectedKeywords: ['scalability', 'maintainability', 'observability', 'metrics', 'code structure'],
+        concept: `Production Engineering & Architecture Part ${index++}`,
+        source: ['jobDescription'],
+        sourceReferences: ['General Engineering Excellence']
+      };
+      results.push(genericQ);
+    }
+
+    return results;
+  };
+
+  // If after parsing/deduplication we have fewer than requested count, fill to exact count
+  if (!freshQuestions || freshQuestions.length < count) {
+    freshQuestions = generateRoleBasedFallbacks(count, freshQuestions || []);
+  }
+
+  return freshQuestions.slice(0, count);
+};
+
+/**
+ * Evaluate a single candidate answer immediately after it's submitted.
+ * Evaluates both raw and normalized speech transcripts, and accounts for self-corrections.
+ */
+export const evaluateSingleAnswer = async ({
+  questionText,
+  answerText,
+  rawTranscript = '',
+  normalizedTranscript = '',
+  expectedKeywords = [],
+  companyName
+}) => {
+  const cleanCompanyName = (companyName || '').replace(/_\d+$/, '');
+  const evaluatedText = (normalizedTranscript || answerText || rawTranscript || '').trim();
+
+  // Fast-path for empty or skipped answers — returns immediately in 0ms without consuming LLM tokens
+  if (!evaluatedText || evaluatedText.length < 5 || evaluatedText.toLowerCase() === 'skipped question' || evaluatedText.toLowerCase() === 'skip') {
+    return {
+      score: 1,
+      feedback: 'No detailed answer provided or question skipped. Explain core algorithms, structures, and trade-offs clearly next time.',
+      correctness: 'low',
+      strengths: [],
+      weaknesses: ['Question was skipped without technical explanation'],
+      missedConcepts: expectedKeywords.slice(0, 3),
+      improvementSuggestions: ['Practice vocalizing your problem-solving process step by step'],
+      isWeak: true
+    };
+  }
+
+  const systemPrompt = `You are a staff-level engineering interviewer and technical mentor evaluating a candidate's answer for a position at ${cleanCompanyName || 'a top tech company'}.
+Current Year: 2026.
+
+EVALUATION RULES:
+1. SPOKEN & SPEECH-TO-TEXT COMPREHENSION: The candidate spoke their answer via microphone. Understand natural conversational speech, pauses, self-corrections, and common speech-to-text transcription artifacts (e.g. "use effect" -> useEffect, "call back" -> callback, "a sync" -> async). Focus on their genuine conceptual understanding.
+2. PEDAGOGICAL CLARITY & STRICT HONESTY: If the answer is incorrect, incomplete, off-topic, or says "I don't know", score it honestly (0-3/10) and provide constructive, educational feedback.
+3. BREAKDOWN MANDATE:
+   - Identify precisely what was missing or technically inaccurate in their response.
+   - Explain the correct technical concept/pattern in 1-2 concise, clear sentences.
+   - Name concrete topics, documentation, or design patterns they should review to master this area.
+4. SCORING SCALE (0 to 10):
+   - 0-2: Completely incorrect, irrelevant, off-topic, or stated they do not know.
+   - 3-4: Very weak, superficial, or confused with major misconceptions.
+   - 5-6: Partially correct foundation but missing key mechanisms, optimizations, or trade-offs.
+   - 7-8: Good, solid technical response covering main principles.
+   - 9-10: Exceptional, nuanced, architecturally sound response with accurate trade-off reasoning.
+
+Respond with pure valid JSON only — no markdown formatting, no explanations outside the JSON object.`;
+
+  const userPrompt = `Interview Question: ${questionText}
+Key Expected Concepts/Keywords: ${expectedKeywords.join(', ') || 'Technical accuracy and problem-solving depth'}
+Candidate Spoken Answer: ${evaluatedText}
+Raw Transcript: ${rawTranscript || evaluatedText}
+
+Return JSON strictly matching this schema:
+{
+  "score": <integer from 0 to 10>,
+  "feedback": "<Clear constructive explanation: (a) what was accurate/missing, (b) the correct technical solution/rationale, (c) specific recommendation>",
+  "correctness": "low" | "medium" | "high",
+  "strengths": ["<Specific concept or communication point executed well>"],
+  "weaknesses": ["<Specific concept omitted, wrong assumption, or missing trade-off>"],
+  "missedConcepts": ["<Exact technical term or mechanism missed>"],
+  "improvementSuggestions": ["<Actionable practice topic or resource (e.g. 'Study React reconciliation & Fiber architecture')>"],
+  "isWeak": <boolean: true if score < 6 else false>
+}`;
+
+  const responseText = await generateLLMResponse(systemPrompt, userPrompt, { maxTokens: 400, temperature: 0.1 });
+
+  try {
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      const finalScore = typeof parsed.score === 'number' ? Math.max(0, Math.min(10, Math.round(parsed.score))) : 3;
+      return {
+        score: finalScore,
+        feedback: parsed.feedback || 'Answer evaluated.',
+        correctness: parsed.correctness || (finalScore >= 7 ? 'high' : finalScore >= 5 ? 'medium' : 'low'),
+        strengths: Array.isArray(parsed.strengths) && parsed.strengths.length > 0 ? parsed.strengths : (finalScore >= 5 ? ['Attempted the technical prompt'] : ['Recorded response']),
+        weaknesses: Array.isArray(parsed.weaknesses) && parsed.weaknesses.length > 0 ? parsed.weaknesses : ['Needs to explain core architecture and mechanisms accurately'],
+        missedConcepts: Array.isArray(parsed.missedConcepts) ? parsed.missedConcepts : expectedKeywords.slice(0, 2),
+        improvementSuggestions: Array.isArray(parsed.improvementSuggestions) && parsed.improvementSuggestions.length > 0 ? parsed.improvementSuggestions : ['Review core implementation mechanics and practice vocalizing trade-offs'],
+        isWeak: finalScore < 6
+      };
+    }
+  } catch (e) {
+    console.warn('Failed to parse single-answer evaluation JSON:', e.message);
+  }
+
+  const isShort = evaluatedText.length < 35;
+  return {
+    score: isShort ? 2 : 4,
+    feedback: isShort ? 'Answer was too brief or incomplete. Explain core patterns and technical rationale.' : 'Answer recorded with moderate clarity. Focus on technical precision.',
+    correctness: isShort ? 'low' : 'medium',
+    strengths: isShort ? [] : ['Addressed the general topic'],
+    weaknesses: ['Add concrete technical depth and mention specific APIs/data structures'],
+    missedConcepts: expectedKeywords.slice(0, 2),
+    improvementSuggestions: ['Practice explaining algorithmic and system trade-offs with structured examples'],
+    isWeak: true
+  };
+};
+
+/**
+ * Generate ONE adaptive follow-up question when a candidate's answer was
+ * weak/incomplete — probes the specific gap without repeating previously asked questions.
+ *
+ * @param {Object} params
+ * @param {string} params.groundingContext - cached local+web research context from session start
+ * @param {string} params.questionText - the question that was just answered weakly
+ * @param {string} params.answerText - the candidate's actual answer
+ * @param {string} params.companyName
+ * @param {string[]} params.previousQuestions - array of questions already asked in this session to prevent duplicate questions
+ */
+export const generateFollowUpQuestion = async ({ groundingContext, questionText, answerText, companyName, previousQuestions = [] }) => {
+  const cleanCompanyName = (companyName || '').replace(/_\d+$/, '');
+
+  const systemPrompt = `You are a senior technical interviewer at ${cleanCompanyName || 'a tech company'}.
+The candidate's last answer was weak or incomplete. Generate exactly ONE follow-up question that:
+- Probes the specific gap in their last answer
+- Does NOT repeat or rephrase any previously asked question listed below
+- Stays grounded ONLY in the provided research context
+- Increases depth rather than changing topic entirely
+- Is phrased naturally, as a real interviewer would ask it aloud
+
+Respond with pure valid JSON only — no markdown fences, no commentary.`;
+
+  const prevText = previousQuestions.length > 0 ? previousQuestions.map((q, i) => `${i + 1}. ${q}`).join('\n') : 'None';
+
+  const userPrompt = `Research context:
+${groundingContext || 'No additional context available — ask a generic deeper technical follow-up.'}
+
+Previously asked questions (DO NOT REPEAT):
+${prevText}
+
+Original Question: ${questionText}
+Candidate's Answer: ${answerText}
+
+Return JSON exactly as:
+{ "followUpQuestion": "..." }`;
+
+  const responseText = await generateLLMResponse(systemPrompt, userPrompt, { maxTokens: 250, temperature: 0.2 });
+
+  try {
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      if (parsed.followUpQuestion && typeof parsed.followUpQuestion === 'string') {
+        return parsed.followUpQuestion.trim();
+      }
+    }
+  } catch (e) {
+    console.warn('Failed to parse follow-up question JSON:', e.message);
+  }
+
+  return null; // caller must handle gracefully — no follow-up inserted if generation fails
+};
+
+/**
+ * Anti-hallucination gate for dynamically-generated content (specifically
+ * used to validate a follow-up question before inserting it into a live
+ * session) — checks whether the generated text is genuinely supported by
+ * the retrieved grounding context, rather than trusting it blindly.
+ *
+ * @param {Object} params
+ * @param {string} params.groundingContext
+ * @param {string} params.modelOutput - the text to validate (e.g. the follow-up question)
+ */
+export const validateGrounding = async ({ groundingContext, modelOutput }) => {
+  // If there's no context to check against at all, we can't meaningfully
+  // validate grounding — treat as ungrounded to be safe (caller should skip
+  // inserting the content rather than risk showing something unverified).
+  if (!groundingContext || !groundingContext.trim()) {
+    return { grounded: false, unsupportedClaims: [], reason: 'No grounding context available to validate against.' };
+  }
+
+  const systemPrompt = `You are a strict validation system. Check whether the given text is fully supported by (i.e. does not contradict or invent facts beyond) the provided context.
+Respond with pure valid JSON only — no markdown fences, no commentary.`;
+
+  const userPrompt = `Context:
+${groundingContext}
+
+Text to validate:
+${modelOutput}
+
+Return JSON exactly as:
+{ "grounded": true|false, "unsupportedClaims": ["..."], "reason": "..." }`;
+
+  try {
+    const responseText = await generateLLMResponse(systemPrompt, userPrompt);
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      return {
+        grounded: parsed.grounded === true,
+        unsupportedClaims: Array.isArray(parsed.unsupportedClaims) ? parsed.unsupportedClaims : [],
+        reason: parsed.reason || ''
+      };
+    }
+  } catch (e) {
+    console.warn('Grounding validation failed, treating as ungrounded to be safe:', e.message);
+  }
+
+  // Fail-safe: if validation itself breaks, don't trust the content by default.
+  return { grounded: false, unsupportedClaims: [], reason: 'Validation check failed to run.' };
 };
 
 // Project Analysis RAG flow

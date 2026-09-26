@@ -16,11 +16,14 @@
     "groq-sdk": "^0.3.3",
     "imagekit": "^6.0.0",
     "jsonwebtoken": "^9.0.3",
+    "mammoth": "^1.12.3",
     "mongoose": "^8.4.1",
     "multer": "^1.4.5-lts.1",
     "node-cron": "^3.0.3",
     "nodemailer": "^6.9.13",
     "pdf-parse": "^1.1.1",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
     "web-push": "^3.6.7"
   }
 }
